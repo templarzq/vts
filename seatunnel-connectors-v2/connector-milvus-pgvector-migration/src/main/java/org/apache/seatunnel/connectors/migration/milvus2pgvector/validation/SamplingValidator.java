@@ -97,7 +97,7 @@ public class SamplingValidator {
                 Map<String, Object> pgRow = queryPgRow(pkName, pkVal);
                 if (pgRow == null) {
                     failed++;
-                    b.addDetail("pk=" + pkVal + ": row not found in pgvector");
+                    b.detail("pk=" + pkVal + ": row not found in pgvector");
                     continue;
                 }
                 checked++;
@@ -105,13 +105,13 @@ public class SamplingValidator {
                 if (!mismatches.isEmpty()) {
                     failed++;
                     for (String m : mismatches) {
-                        b.addDetail(m);
+                        b.detail(m);
                     }
                 }
             }
             b.totalChecked(checked).failedCount(failed).passed(failed == 0);
             if (failed == 0) {
-                b.addDetail("All " + checked + " sampled rows match field-by-field");
+                b.detail("All " + checked + " sampled rows match field-by-field");
             }
         } catch (MigrationException e) {
             b.passed(false).errorMessage(e.getMessage());

@@ -56,26 +56,35 @@ public class RecordCountValidator {
 
     public ValidationResult validate() {
         long start = System.currentTimeMillis();
-        ValidationResult.ValidationResultBuilder b =
-                ValidationResult.builder().validatorName("RecordCountValidator");
+        java.util.List<String> details = new java.util.ArrayList<>();
+        boolean passed = false;
+        int failedCount = 0;
+        String errorMessage = null;
         try {
             long milvusCount = getMilvusCount();
             long pgCount = getPgCount();
-            b.totalChecked(1);
             if (milvusCount == pgCount) {
-                b.passed(true);
-                b.addDetail("milvus=" + milvusCount + ", pgvector=" + pgCount + " — match");
+                passed = true;
+                details.add("milvus=" + milvusCount + ", pgvector=" + pgCount + " — match");
             } else {
-                b.passed(false).failedCount(1);
-                b.addDetail("milvus=" + milvusCount + ", pgvector=" + pgCount + " — MISMATCH");
+                failedCount = 1;
+                details.add("milvus=" + milvusCount + ", pgvector=" + pgCount + " — MISMATCH");
             }
             log.info("Record count: milvus={}, pgvector={}", milvusCount, pgCount);
         } catch (Exception e) {
-            b.passed(false).failedCount(1).errorMessage(e.getMessage());
+            failedCount = 1;
+            errorMessage = e.getMessage();
             log.error("Record count validation failed", e);
         }
-        b.durationMs(System.currentTimeMillis() - start);
-        return b.build();
+        return ValidationResult.builder()
+                .validatorName("RecordCountValidator")
+                .passed(passed)
+                .totalChecked(1)
+                .failedCount(failedCount)
+                .details(details)
+                .errorMessage(errorMessage)
+                .durationMs(System.currentTimeMillis() - start)
+                .build();
     }
 
     private long getMilvusCount() {

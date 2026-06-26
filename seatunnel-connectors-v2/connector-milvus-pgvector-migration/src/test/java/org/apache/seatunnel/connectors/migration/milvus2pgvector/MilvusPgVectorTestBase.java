@@ -35,8 +35,8 @@ import org.testcontainers.lifecycle.Startables;
 import org.testcontainers.milvus.MilvusContainer;
 import org.testcontainers.utility.DockerImageName;
 
-import com.google.gson.Gson;
-import com.google.gson.JsonObject;
+import milvus.com.google.gson.Gson;
+import milvus.com.google.gson.JsonObject;
 
 import java.sql.Connection;
 import java.sql.DriverManager;
@@ -75,7 +75,7 @@ public abstract class MilvusPgVectorTestBase {
         pgContainer =
                 new PostgreSQLContainer<>(DockerImageName.parse(PG_IMAGE))
                         .withNetwork(NETWORK)
-                        .withDatabase(PG_DATABASE)
+                        .withDatabaseName(PG_DATABASE)
                         .withUsername(PG_USER)
                         .withPassword(PG_PASSWORD);
 

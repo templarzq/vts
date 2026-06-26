@@ -85,7 +85,7 @@ public class VectorSimilarityValidator {
                 ValidationResult.builder().validatorName("VectorSimilarityValidator");
         MigrationSchema.ColumnDef vectorCol = findFirstVectorColumn();
         if (vectorCol == null) {
-            b.passed(true).totalChecked(0).addDetail("No vector column found; skipping");
+            b.passed(true).totalChecked(0).detail("No vector column found; skipping");
             b.durationMs(System.currentTimeMillis() - start);
             return b.build();
         }
@@ -109,25 +109,25 @@ public class VectorSimilarityValidator {
                 float[] pgVec = queryPgVector(pkName, pkVal, vectorCol.getName());
                 if (pgVec == null) {
                     failed++;
-                    b.addDetail("pk=" + pkVal + ": row not found in pgvector");
+                    b.detail("pk=" + pkVal + ": row not found in pgvector");
                     continue;
                 }
                 if (milvusVec == null) {
                     failed++;
-                    b.addDetail("pk=" + pkVal + ": Milvus vector is null");
+                    b.detail("pk=" + pkVal + ": Milvus vector is null");
                     continue;
                 }
                 double sim = cosineSimilarity(milvusVec, pgVec);
                 checked++;
                 if (sim < similarityThreshold) {
                     failed++;
-                    b.addDetail(
+                    b.detail(
                             "pk=" + pkVal + ": similarity=" + sim + " < threshold=" + similarityThreshold);
                 }
             }
             b.totalChecked(checked).failedCount(failed).passed(failed == 0);
             if (failed == 0) {
-                b.addDetail(
+                b.detail(
                         "All " + checked + " sampled vectors >= threshold " + similarityThreshold);
             }
         } catch (MigrationException e) {

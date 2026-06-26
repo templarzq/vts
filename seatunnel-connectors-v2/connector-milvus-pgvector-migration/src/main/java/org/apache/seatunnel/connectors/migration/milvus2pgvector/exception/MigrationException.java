@@ -17,22 +17,22 @@
 
 package org.apache.seatunnel.connectors.migration.milvus2pgvector.exception;
 
-import org.apache.seatunnel.common.exception.CommonErrorCode;
+import org.apache.seatunnel.common.exception.SeaTunnelErrorCode;
 import org.apache.seatunnel.common.exception.SeaTunnelRuntimeException;
 
 public class MigrationException extends SeaTunnelRuntimeException {
 
     private static final long serialVersionUID = 1L;
 
-    public MigrationException(CommonErrorCode errorCode, String errorMessage) {
+    public MigrationException(SeaTunnelErrorCode errorCode, String errorMessage) {
         super(errorCode, errorMessage);
     }
 
-    public MigrationException(CommonErrorCode errorCode, String errorMessage, Throwable cause) {
+    public MigrationException(SeaTunnelErrorCode errorCode, String errorMessage, Throwable cause) {
         super(errorCode, errorMessage, cause);
     }
 
-    public MigrationException(CommonErrorCode errorCode, Throwable cause) {
+    public MigrationException(SeaTunnelErrorCode errorCode, Throwable cause) {
         super(errorCode, cause);
     }
 }

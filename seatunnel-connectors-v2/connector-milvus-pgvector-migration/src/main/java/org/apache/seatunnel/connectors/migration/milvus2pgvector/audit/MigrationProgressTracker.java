@@ -33,7 +33,7 @@ import java.util.Optional;
  * <p>State file: {@code {logDir}/{collectionName}_progress.json}
  */
 @Slf4j
-public class MigrationProgressTracker {
+public class MigrationProgressTracker implements AutoCloseable {
 
     public enum Phase {
         SCHEMA,
@@ -141,6 +141,11 @@ public class MigrationProgressTracker {
 
     public ProgressState getState() {
         return state;
+    }
+
+    @Override
+    public void close() {
+        save();
     }
 
     private void setStatus(Phase phase, Status status) {

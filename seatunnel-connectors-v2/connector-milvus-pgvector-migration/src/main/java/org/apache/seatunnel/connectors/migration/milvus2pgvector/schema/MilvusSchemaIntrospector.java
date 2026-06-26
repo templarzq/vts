@@ -46,11 +46,11 @@ public class MilvusSchemaIntrospector implements AutoCloseable {
 
     public MilvusSchemaIntrospector(String url, String token) {
         try {
-            ConnectConfig.Builder builder = ConnectConfig.builder().uri(url);
-            if (token != null && !token.isEmpty()) {
-                builder.token(token);
-            }
-            this.client = new MilvusClientV2(builder.build());
+            ConnectConfig config =
+                    (token != null && !token.isEmpty())
+                            ? ConnectConfig.builder().uri(url).token(token).build()
+                            : ConnectConfig.builder().uri(url).build();
+            this.client = new MilvusClientV2(config);
         } catch (Exception e) {
             throw new MigrationException(
                     MigrationErrorCode.SCHEMA_INTROSPECTION_FAILED,
@@ -78,7 +78,10 @@ public class MilvusSchemaIntrospector implements AutoCloseable {
                                 .dataType(field.getDataType())
                                 .elementType(field.getElementType())
                                 .dimension(field.getDimension())
-                                .maxLength(field.getMaxLength())
+                                .maxLength(
+                                        field.getMaxLength() != null
+                                                ? field.getMaxLength().longValue()
+                                                : null)
                                 .nullable(Boolean.TRUE.equals(field.getIsNullable()))
                                 .isPrimaryKey(field.getIsPrimaryKey())
                                 .isPartitionKey(field.getIsPartitionKey())
@@ -132,7 +135,7 @@ public class MilvusSchemaIntrospector implements AutoCloseable {
                                     .indexName(desc.getIndexName())
                                     .indexType(desc.getIndexType())
                                     .metricType(desc.getMetricType())
-                                    .extraParams(desc.getExtraParams())
+                                    .extraParams(convertExtraParams(desc.getExtraParams()))
                                     .build());
                 }
             }
@@ -149,5 +152,17 @@ public class MilvusSchemaIntrospector implements AutoCloseable {
         } catch (Exception e) {
             log.warn("Failed to close Milvus client", e);
         }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> convertExtraParams(Map<String, ?> raw) {
+        if (raw == null) {
+            return null;
+        }
+        Map<String, Object> result = new java.util.HashMap<>();
+        for (Map.Entry<String, ?> entry : raw.entrySet()) {
+            result.put(entry.getKey(), entry.getValue());
+        }
+        return result;
     }
 }

@@ -30,6 +30,7 @@ import org.apache.seatunnel.connectors.migration.milvus2pgvector.exception.Migra
 import org.junit.jupiter.api.Test;
 
 import java.nio.ByteBuffer;
+import java.util.Arrays;
 import java.util.Collections;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -39,7 +40,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 public class MilvusToPgVectorTransformTest {
 
     private static CatalogTable buildCatalogTable(Column... columns) {
-        TableSchema schema = TableSchema.builder().column(columns).build();
+        TableSchema schema = TableSchema.builder().columns(Arrays.asList(columns)).build();
         TableIdentifier id =
                 TableIdentifier.of("milvus", "default", null, "my_collection");
         return CatalogTable.of(

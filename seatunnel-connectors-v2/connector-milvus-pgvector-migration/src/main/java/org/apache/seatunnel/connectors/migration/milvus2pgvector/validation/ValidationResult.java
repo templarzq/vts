@@ -19,6 +19,7 @@ package org.apache.seatunnel.connectors.migration.milvus2pgvector.validation;
 
 import lombok.Builder;
 import lombok.Data;
+import lombok.Singular;
 
 import java.io.Serializable;
 import java.util.ArrayList;
@@ -35,11 +36,14 @@ public class ValidationResult implements Serializable {
     private boolean passed;
     @Builder.Default private int totalChecked = 0;
     @Builder.Default private int failedCount = 0;
-    @Builder.Default private List<String> details = new ArrayList<>();
+    @Singular private List<String> details;
     private String errorMessage;
     @Builder.Default private long durationMs = 0L;
 
     public void addDetail(String detail) {
+        if (details == null) {
+            details = new ArrayList<>();
+        }
         details.add(detail);
     }
 

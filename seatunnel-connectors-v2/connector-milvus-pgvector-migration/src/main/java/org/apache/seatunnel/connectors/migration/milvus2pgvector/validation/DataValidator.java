@@ -23,7 +23,7 @@ import io.milvus.v2.client.MilvusClientV2;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.seatunnel.connectors.migration.milvus2pgvector.config.MigrationConfig;
 import org.apache.seatunnel.connectors.migration.milvus2pgvector.exception.MigrationErrorCode;
-import org.apache.seatunnel.connectors.milvus2pgvector.exception.MigrationException;
+import org.apache.seatunnel.connectors.migration.milvus2pgvector.exception.MigrationException;
 import org.apache.seatunnel.connectors.migration.milvus2pgvector.internal.TokenBucketRateLimiter;
 import org.apache.seatunnel.connectors.migration.milvus2pgvector.schema.MigrationSchema;
 
@@ -100,11 +100,14 @@ public class DataValidator implements AutoCloseable {
 
     private void connect() {
         try {
-            ConnectConfig.Builder builder = ConnectConfig.builder().uri(config.getMilvusUrl());
-            if (config.getMilvusToken() != null && !config.getMilvusToken().isEmpty()) {
-                builder.token(config.getMilvusToken());
-            }
-            milvusClient = new MilvusClientV2(builder.build());
+            ConnectConfig connectConfig =
+                    (config.getMilvusToken() != null && !config.getMilvusToken().isEmpty())
+                            ? ConnectConfig.builder()
+                                    .uri(config.getMilvusUrl())
+                                    .token(config.getMilvusToken())
+                                    .build()
+                            : ConnectConfig.builder().uri(config.getMilvusUrl()).build();
+            milvusClient = new MilvusClientV2(connectConfig);
         } catch (Exception e) {
             throw new MigrationException(
                     MigrationErrorCode.VALIDATION_QUERY_FAILED,
