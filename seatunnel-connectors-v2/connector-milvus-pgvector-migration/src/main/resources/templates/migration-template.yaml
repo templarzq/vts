@@ -1,0 +1,72 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+#
+# Milvus → pgvector Migration Configuration Template
+#
+# Usage:
+#   java ... MigrationCli --config migration-config.properties
+#
+# This file uses a flat key=value format (Java Properties) for direct use
+# with the --config flag. The YAML structure below is for human readability;
+# flatten the keys (e.g. milvus.url=...) when using as a properties file.
+#
+# CLI arguments always override values from the config file.
+#
+
+# ---- Milvus source ----
+milvus.url=http://localhost:19530
+milvus.token=
+milvus.database=default
+milvus.collection=my_collection
+
+# ---- pgvector target ----
+pg.url=jdbc:postgresql://localhost:5432/vectordb
+pg.user=postgres
+pg.password=postgres
+pg.schema=public
+# pg.table defaults to the collection name if left empty
+pg.table=
+
+# ---- performance ----
+batch.size=1000
+parallelism=1
+# Max rows per second; 0 = unlimited
+rate.limit=0
+
+# ---- behavior ----
+skip.index.migration=false
+drop.existing.table=false
+# If true, forbids BFloat16 → halfvec precision loss
+no.precision.loss=false
+
+# ---- phase control ----
+# Set one of these to true to run only that phase
+# validate.only=false
+# schema.only=false
+# data.only=false
+# resume=false
+
+# ---- validation ----
+sample.size=100
+similarity.threshold=0.9999
+
+# ---- audit ----
+audit.log_dir=./migration-logs
+
+# ---- seatunnel ----
+# Leave empty to use SEATUNNEL_HOME environment variable
+seatunnel.home=

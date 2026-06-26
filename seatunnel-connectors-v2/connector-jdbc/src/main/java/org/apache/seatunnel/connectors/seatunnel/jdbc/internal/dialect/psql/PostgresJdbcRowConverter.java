@@ -24,6 +24,7 @@ import org.apache.seatunnel.api.table.type.ArrayType;
 import org.apache.seatunnel.api.table.type.SeaTunnelDataType;
 import org.apache.seatunnel.api.table.type.SeaTunnelRow;
 import org.apache.seatunnel.api.table.type.SeaTunnelRowType;
+import org.apache.seatunnel.api.table.type.SqlType;
 import org.apache.seatunnel.common.exception.CommonErrorCodeDeprecated;
 import org.apache.seatunnel.common.utils.BufferUtils;
 import org.apache.seatunnel.connectors.seatunnel.jdbc.exception.JdbcConnectorException;
@@ -31,9 +32,13 @@ import org.apache.seatunnel.connectors.seatunnel.jdbc.internal.converter.Abstrac
 import org.apache.seatunnel.connectors.seatunnel.jdbc.internal.dialect.DatabaseIdentifier;
 import org.apache.seatunnel.connectors.seatunnel.jdbc.utils.JdbcFieldTypeUtils;
 
+import org.postgresql.util.PGobject;
+
 import javax.annotation.Nullable;
+import java.nio.ByteBuffer;
 import java.sql.Array;
 import java.sql.Date;
+import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Time;
@@ -168,6 +173,34 @@ public class PostgresJdbcRowConverter extends AbstractJdbcRowConverter {
             }
         }
         return new SeaTunnelRow(fields);
+    }
+
+    @Override
+    protected void setValueToStatementByDataType(
+            Object value,
+            PreparedStatement statement,
+            SeaTunnelDataType<?> seaTunnelDataType,
+            int statementIndex,
+            @Nullable String sourceType)
+            throws SQLException {
+        if (SqlType.FLOAT_VECTOR.equals(seaTunnelDataType.getSqlType())) {
+            Float[] floatArray = BufferUtils.toFloatArray((ByteBuffer) value);
+            StringBuilder vectorString = new StringBuilder("[");
+            for (int i = 0; i < floatArray.length; i++) {
+                if (i > 0) {
+                    vectorString.append(",");
+                }
+                vectorString.append(floatArray[i]);
+            }
+            vectorString.append("]");
+            PGobject pgVector = new PGobject();
+            pgVector.setType("vector");
+            pgVector.setValue(vectorString.toString());
+            statement.setObject(statementIndex, pgVector);
+            return;
+        }
+        super.setValueToStatementByDataType(
+                value, statement, seaTunnelDataType, statementIndex, sourceType);
     }
 
     private OffsetDateTime getPostgresOffsetDateTime(ResultSet rs, int columnIndex)

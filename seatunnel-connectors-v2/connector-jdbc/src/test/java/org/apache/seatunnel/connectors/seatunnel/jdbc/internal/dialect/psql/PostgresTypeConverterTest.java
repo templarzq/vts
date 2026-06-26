@@ -26,6 +26,7 @@ import org.apache.seatunnel.api.table.type.DecimalType;
 import org.apache.seatunnel.api.table.type.LocalTimeType;
 import org.apache.seatunnel.api.table.type.MapType;
 import org.apache.seatunnel.api.table.type.PrimitiveByteArrayType;
+import org.apache.seatunnel.api.table.type.VectorType;
 import org.apache.seatunnel.common.exception.SeaTunnelRuntimeException;
 
 import org.junit.jupiter.api.Assertions;
@@ -882,5 +883,34 @@ public class PostgresTypeConverterTest {
         Assertions.assertEquals(
                 PostgresTypeConverter.PG_SMALLINT_ARRAY, typeDefine.getColumnType());
         Assertions.assertEquals(PostgresTypeConverter.PG_SMALLINT_ARRAY, typeDefine.getDataType());
+    }
+
+    @Test
+    public void testReconvertFloatVector() {
+        Column column =
+                PhysicalColumn.builder()
+                        .name("test")
+                        .dataType(VectorType.VECTOR_FLOAT_TYPE)
+                        .build();
+
+        BasicTypeDefine typeDefine = PostgresTypeConverter.INSTANCE.reconvert(column);
+        Assertions.assertEquals(column.getName(), typeDefine.getName());
+        Assertions.assertEquals(PostgresTypeConverter.PG_VECTOR, typeDefine.getColumnType());
+        Assertions.assertEquals(PostgresTypeConverter.PG_VECTOR, typeDefine.getDataType());
+
+        column =
+                PhysicalColumn.builder()
+                        .name("test")
+                        .dataType(VectorType.VECTOR_FLOAT_TYPE)
+                        .scale(384)
+                        .build();
+
+        typeDefine = PostgresTypeConverter.INSTANCE.reconvert(column);
+        Assertions.assertEquals(column.getName(), typeDefine.getName());
+        Assertions.assertEquals(
+                String.format("%s(%s)", PostgresTypeConverter.PG_VECTOR, 384),
+                typeDefine.getColumnType());
+        Assertions.assertEquals(PostgresTypeConverter.PG_VECTOR, typeDefine.getDataType());
+        Assertions.assertEquals(384, typeDefine.getScale());
     }
 }

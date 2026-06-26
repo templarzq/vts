@@ -25,12 +25,14 @@ import org.apache.seatunnel.api.table.type.LocalTimeType;
 import org.apache.seatunnel.api.table.type.SeaTunnelDataType;
 import org.apache.seatunnel.api.table.type.SeaTunnelRow;
 import org.apache.seatunnel.api.table.type.VectorType;
+import org.apache.seatunnel.common.utils.BufferUtils;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.postgresql.util.PGobject;
 
+import java.nio.ByteBuffer;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.ResultSetMetaData;
@@ -170,6 +172,43 @@ public class PostgresJdbcRowConverterTest {
         Assertions.assertNotNull(row);
         Assertions.assertEquals(1, row.getField(0));
         Assertions.assertNull(row.getField(1), "embedding should be null");
+    }
+
+    @Test
+    public void testToExternalWithFloatVector() throws SQLException {
+        TableSchema tableSchema =
+                createTableSchema("embedding", VectorType.VECTOR_FLOAT_TYPE, null);
+
+        Float[] vectorData = new Float[] {1.0f, 2.0f, 3.0f};
+        ByteBuffer byteBuffer = BufferUtils.toByteBuffer(vectorData);
+        SeaTunnelRow row = new SeaTunnelRow(new Object[] {1, byteBuffer});
+
+        PreparedStatement statement = mock(PreparedStatement.class);
+
+        converter.toExternal(tableSchema, row, statement);
+
+        verify(statement).setInt(1, 1);
+
+        ArgumentCaptor<PGobject> captor = ArgumentCaptor.forClass(PGobject.class);
+        verify(statement).setObject(eq(2), captor.capture());
+        PGobject pgObject = captor.getValue();
+        Assertions.assertEquals("vector", pgObject.getType());
+        Assertions.assertEquals("[1.0,2.0,3.0]", pgObject.getValue());
+    }
+
+    @Test
+    public void testToExternalWithNullFloatVector() throws SQLException {
+        TableSchema tableSchema =
+                createTableSchema("embedding", VectorType.VECTOR_FLOAT_TYPE, null);
+
+        SeaTunnelRow row = new SeaTunnelRow(new Object[] {1, null});
+
+        PreparedStatement statement = mock(PreparedStatement.class);
+
+        converter.toExternal(tableSchema, row, statement);
+
+        verify(statement).setInt(1, 1);
+        verify(statement).setObject(2, null);
     }
 
 }

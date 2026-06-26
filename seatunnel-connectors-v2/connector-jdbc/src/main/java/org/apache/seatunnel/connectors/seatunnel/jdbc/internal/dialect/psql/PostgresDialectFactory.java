@@ -43,6 +43,9 @@ public class PostgresDialectFactory implements JdbcDialectFactory {
         if ("postgresLow".equalsIgnoreCase(compatibleMode)) {
             return new PostgresLowDialect(fieldIde);
         }
+        if ("pgvector".equalsIgnoreCase(compatibleMode)) {
+            return new PgVectorDialect(fieldIde);
+        }
         return new PostgresDialect(fieldIde);
     }
 }

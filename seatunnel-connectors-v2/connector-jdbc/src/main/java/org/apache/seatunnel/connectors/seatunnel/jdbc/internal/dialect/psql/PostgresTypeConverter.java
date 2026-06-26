@@ -510,6 +510,16 @@ public class PostgresTypeConverter implements TypeConverter<BasicTypeDefine> {
                                 column.getName());
                 }
                 break;
+            case FLOAT_VECTOR:
+                Integer vectorDimension = column.getScale();
+                if (vectorDimension != null && vectorDimension > 0) {
+                    builder.columnType(String.format("%s(%s)", PG_VECTOR, vectorDimension));
+                } else {
+                    builder.columnType(PG_VECTOR);
+                }
+                builder.dataType(PG_VECTOR);
+                builder.scale(vectorDimension);
+                break;
             default:
                 throw CommonError.convertToConnectorTypeError(
                         DatabaseIdentifier.POSTGRESQL,
