@@ -208,6 +208,12 @@
                 </dependency>
                 <dependency>
                     <groupId>org.apache.seatunnel</groupId>
+                    <artifactId>connector-milvus-pgvector-migration</artifactId>
+                    <version>${project.version}</version>
+                    <scope>provided</scope>
+                </dependency>
+                <dependency>
+                    <groupId>org.apache.seatunnel</groupId>
                     <artifactId>connector-elasticsearch</artifactId>
                     <version>${project.version}</version>
                     <scope>provided</scope>
@@ -560,6 +566,12 @@
                 <dependency>
                     <groupId>org.apache.seatunnel</groupId>
                     <artifactId>connector-jdbc</artifactId>
+                    <version>${project.version}</version>
+                    <scope>provided</scope>
+                </dependency>
+                <dependency>
+                    <groupId>org.apache.seatunnel</groupId>
+                    <artifactId>connector-milvus-pgvector-migration</artifactId>
                     <version>${project.version}</version>
                     <scope>provided</scope>
                 </dependency>
