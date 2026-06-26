@@ -54,7 +54,6 @@
             <groupId>org.apache.seatunnel</groupId>
             <artifactId>seatunnel-transforms-v2</artifactId>
             <version>${project.version}</version>
-            <scope>provided</scope>
         </dependency>
 
         <!-- Test dependencies -->
@@ -95,4 +94,35 @@
             <scope>test</scope>
         </dependency>
     </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-shade-plugin</artifactId>
+                <configuration>
+                    <filters>
+                        <filter>
+                            <artifact>org.apache.seatunnel:seatunnel-transforms-v2</artifact>
+                            <excludes>
+                                <exclude>META-INF/services/**</exclude>
+                            </excludes>
+                        </filter>
+                        <filter>
+                            <artifact>org.apache.seatunnel:connector-milvus</artifact>
+                            <excludes>
+                                <exclude>META-INF/services/**</exclude>
+                            </excludes>
+                        </filter>
+                        <filter>
+                            <artifact>org.apache.seatunnel:connector-jdbc</artifact>
+                            <excludes>
+                                <exclude>META-INF/services/**</exclude>
+                            </excludes>
+                        </filter>
+                    </filters>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
 </project>
