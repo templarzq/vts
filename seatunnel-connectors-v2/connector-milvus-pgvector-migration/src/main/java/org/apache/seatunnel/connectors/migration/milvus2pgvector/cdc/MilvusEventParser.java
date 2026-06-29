@@ -25,8 +25,8 @@ import io.milvus.grpc.MsgType;
 import io.milvus.v2.service.collection.request.CreateCollectionReq;
 import io.milvus.v2.service.collection.response.DescribeCollectionResp;
 
-import com.google.protobuf.ByteString;
-import com.google.protobuf.InvalidProtocolBufferException;
+import milvus.com.google.protobuf.ByteString;
+import milvus.com.google.protobuf.InvalidProtocolBufferException;
 import lombok.extern.slf4j.Slf4j;
 import milvus.proto.msg.Msg;
 

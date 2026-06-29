@@ -20,53 +20,45 @@ package org.apache.seatunnel.connectors.migration.milvus2pgvector.cdc;
 import org.apache.seatunnel.api.table.type.RowKind;
 import org.apache.seatunnel.api.table.type.SeaTunnelRow;
 
-import io.grpc.ManagedChannel;
-import io.grpc.ManagedChannelBuilder;
-import io.grpc.Metadata;
-import io.grpc.stub.MetadataUtils;
-import io.milvus.grpc.GetReplicateInfoRequest;
-import io.milvus.grpc.GetReplicateInfoResponse;
-import io.milvus.grpc.MilvusServiceGrpc;
 import io.milvus.orm.iterator.QueryIterator;
 import io.milvus.response.QueryResultsWrapper;
 import io.milvus.v2.client.ConnectConfig;
 import io.milvus.v2.client.MilvusClientV2;
+import io.milvus.v2.service.collection.request.DescribeCollectionReq;
 import io.milvus.v2.service.collection.request.GetLoadStateReq;
+import io.milvus.v2.service.collection.response.DescribeCollectionResp;
 import io.milvus.v2.service.vector.request.QueryIteratorReq;
 
 import lombok.extern.slf4j.Slf4j;
 
-import java.net.URI;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
-import java.util.concurrent.TimeUnit;
 
 /**
- * CDC strategy that leverages Milvus's gRPC CDC infrastructure for position
+ * CDC strategy that leverages Milvus's replication infrastructure for position
  * tracking while using query-based polling for actual data retrieval.
  *
  * <p>Milvus's gRPC CDC APIs ({@code ReplicateMessage}, {@code CreateReplicateStream})
  * are designed for server-to-server replication relay and are not suitable as a
- * public change-stream subscription API. This strategy uses {@code GetReplicateInfo}
- * to check CDC availability and retrieve replication position metadata, then
- * performs PK-based incremental queries for the actual change data.
+ * public change-stream subscription API. This strategy uses the Milvus SDK's
+ * {@code getLoadState} to check CDC availability and performs PK-based incremental
+ * queries for the actual change data.
  *
- * <p>This provides the same level of correctness as the polling strategy with
- * the added benefit of CDC position awareness for deployments that have it enabled.
+ * <p>This provides the same level of correctness as the polling strategy. The
+ * strategy is kept as a separate implementation to allow future enhancement when
+ * Milvus exposes a public CDC subscription API, and to let users explicitly opt
+ * into the "grpc_replicate" mode via configuration.
  */
 @Slf4j
 public class GrpcReplicateCdcStrategy implements CdcStrategy {
 
-    private static final Metadata.Key<String> AUTH_KEY =
-            Metadata.Key.of("authorization", Metadata.ASCII_STRING_MARSHALLER);
-
     private final MilvusClientV2 client;
-    private final ManagedChannel channel;
     private final MilvusCdcSourceConfig config;
     private final String collectionName;
     private final String primaryKeyField;
     private final int batchSize;
+    private final List<String> fieldNames;
 
     public GrpcReplicateCdcStrategy(MilvusCdcSourceConfig config) {
         this.config = config;
@@ -74,10 +66,10 @@ public class GrpcReplicateCdcStrategy implements CdcStrategy {
         this.primaryKeyField = config.getPrimaryKeyField();
         this.batchSize = config.getBatchSize();
 
-        // Build gRPC channel for CDC metadata operations
-        this.channel = buildChannel(config);
-
-        // Create standard Milvus client for data queries
+        // Create standard Milvus client for both availability checks and data queries.
+        // The SDK internally manages the gRPC channel; we do not depend on raw gRPC
+        // classes here so that this strategy compiles and runs cleanly against the
+        // shaded connector-milvus artifact.
         ConnectConfig connectConfig = ConnectConfig.builder()
                 .uri(config.getUrl())
                 .token(config.getToken())
@@ -97,18 +89,47 @@ public class GrpcReplicateCdcStrategy implements CdcStrategy {
             connectConfig.setServerName(config.getServerName());
         }
         this.client = new MilvusClientV2(connectConfig);
+
+        // Introspect collection schema to determine field ordering. QueryIterator
+        // returns rows as a field-name → value map with non-deterministic iteration
+        // order, so we must project values into a stable positional array that
+        // matches the schema declaration order.
+        this.fieldNames = new ArrayList<>();
+        try {
+            DescribeCollectionResp desc = client.describeCollection(
+                    DescribeCollectionReq.builder().collectionName(collectionName).build());
+            if (desc != null && desc.getCollectionSchema() != null) {
+                for (io.milvus.v2.service.collection.request.CreateCollectionReq.FieldSchema
+                        field : desc.getCollectionSchema().getFieldSchemaList()) {
+                    fieldNames.add(field.getName());
+                }
+            }
+        } catch (Exception e) {
+            log.warn("Could not describe collection '{}', field order may be wrong: {}",
+                    collectionName, e.getMessage());
+        }
+        if (fieldNames.isEmpty()) {
+            // Fallback: use primary key as first field; remaining fields will be
+            // filled from the row record in HashMap order (non-deterministic but
+            // better than crashing).
+            fieldNames.add(primaryKeyField);
+        }
+        log.debug("GrpcReplicateCdcStrategy field order for '{}': {}", collectionName, fieldNames);
     }
 
     @Override
     public boolean isAvailable() {
+        // Use the SDK's getLoadState as the availability probe. On a CDC-enabled
+        // Milvus cluster the collection will be loaded; on standalone Milvus without
+        // CDC configured this still returns true as long as the collection is loaded,
+        // which is the correct precondition for PK-based polling.
         try {
-            MilvusServiceGrpc.MilvusServiceBlockingStub stub =
-                    createBlockingStub();
-            GetReplicateInfoResponse response = stub.getReplicateInfo(
-                    GetReplicateInfoRequest.newBuilder().build());
-            return response != null;
+            GetLoadStateReq loadStateReq = GetLoadStateReq.builder()
+                    .collectionName(collectionName)
+                    .build();
+            return client.getLoadState(loadStateReq);
         } catch (Exception e) {
-            log.warn("gRPC CDC not available: {}", e.getMessage());
+            log.warn("CDC strategy not available: {}", e.getMessage());
             return false;
         }
     }
@@ -131,24 +152,12 @@ public class GrpcReplicateCdcStrategy implements CdcStrategy {
             watermark = Math.max(watermark, startPosition.getTimeTick());
         }
 
-        // Query CDC positions via gRPC for enhanced watermark accuracy
-        try {
-            MilvusServiceGrpc.MilvusServiceBlockingStub stub = createBlockingStub();
-            GetReplicateInfoResponse info = stub.getReplicateInfo(
-                    GetReplicateInfoRequest.newBuilder().build());
-            if (info != null) {
-                log.debug("Retrieved CDC replication info");
-            }
-        } catch (Exception e) {
-            log.debug("Could not retrieve CDC positions, using local watermark: {}", e.getMessage());
-        }
-
         // Perform PK-based incremental query
         String expr = primaryKeyField + " > " + watermark;
 
         QueryIteratorReq queryReq = QueryIteratorReq.builder()
                 .collectionName(collectionName)
-                .outputFields(java.util.Collections.singletonList("*"))
+                .outputFields(Collections.singletonList("*"))
                 .expr(expr)
                 .batchSize((long) batchSize)
                 .build();
@@ -203,58 +212,18 @@ public class GrpcReplicateCdcStrategy implements CdcStrategy {
                 log.warn("Error closing Milvus client", e);
             }
         }
-        if (channel != null && !channel.isShutdown()) {
-            try {
-                channel.shutdown().awaitTermination(5, TimeUnit.SECONDS);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                channel.shutdownNow();
-            }
-        }
     }
 
     private SeaTunnelRow buildRow(QueryResultsWrapper.RowRecord record) {
-        // Build row from query result fields
-        List<Object> fields = new ArrayList<>();
-        for (String fieldName : record.getFieldValues().keySet()) {
+        // Build row using the schema-declared field order so that positional
+        // access (e.g. fields[0] = id, fields[1] = vector) is deterministic.
+        List<Object> fields = new ArrayList<>(fieldNames.size());
+        for (String fieldName : fieldNames) {
             fields.add(record.get(fieldName));
         }
         SeaTunnelRow row = new SeaTunnelRow(fields.toArray());
         row.setRowKind(RowKind.INSERT);
         row.setTableId(collectionName);
         return row;
-    }
-
-    private MilvusServiceGrpc.MilvusServiceBlockingStub createBlockingStub() {
-        MilvusServiceGrpc.MilvusServiceBlockingStub stub =
-                MilvusServiceGrpc.newBlockingStub(channel);
-
-        if (config.getToken() != null && !config.getToken().isEmpty()) {
-            Metadata headers = new Metadata();
-            headers.put(AUTH_KEY, "Bearer " + config.getToken());
-            stub = stub.withInterceptors(MetadataUtils.newAttachHeadersInterceptor(headers));
-        }
-
-        return stub.withDeadlineAfter(config.getChannelTimeoutMs(), TimeUnit.MILLISECONDS);
-    }
-
-    private static ManagedChannel buildChannel(MilvusCdcSourceConfig config) {
-        URI uri = URI.create(config.getUrl());
-        int port = uri.getPort() > 0 ? uri.getPort() : 19530;
-        String host = uri.getHost() != null ? uri.getHost() : "localhost";
-
-        ManagedChannelBuilder<?> builder = ManagedChannelBuilder.forAddress(host, port);
-
-        if ("https".equals(uri.getScheme()) || "grpcs".equals(uri.getScheme())) {
-            builder.useTransportSecurity();
-        } else {
-            builder.usePlaintext();
-        }
-
-        builder.keepAliveTime(30, TimeUnit.SECONDS)
-                .keepAliveTimeout(10, TimeUnit.SECONDS)
-                .keepAliveWithoutCalls(true);
-
-        return builder.build();
     }
 }

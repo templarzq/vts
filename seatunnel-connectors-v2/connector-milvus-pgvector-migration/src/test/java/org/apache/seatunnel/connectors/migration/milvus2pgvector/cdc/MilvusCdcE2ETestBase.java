@@ -511,6 +511,81 @@ public abstract class MilvusCdcE2ETestBase {
     }
 
     /**
+     * Build a {@link GrpcReplicateCdcStrategy} for the given collection. The gRPC strategy
+     * creates its own Milvus client and gRPC channel internally; callers must close it after
+     * use (try-with-resources or explicit close).
+     */
+    protected GrpcReplicateCdcStrategy buildGrpcStrategy(
+            String collectionName, int batchSize) {
+        Map<String, Object> configMap = new HashMap<>();
+        configMap.put("url", MILVUS_URL);
+        configMap.put("token", MILVUS_TOKEN);
+        configMap.put("database", MILVUS_DB);
+        configMap.put("collection", collectionName);
+        configMap.put("batch_size", batchSize);
+        configMap.put("incremental_batch_size", 500L);
+        configMap.put("poll_interval_ms", 500L);
+        configMap.put("startup_mode", "INITIAL");
+        configMap.put("cdc_strategy", "grpc_replicate");
+        configMap.put("primary_key_field", "id");
+        configMap.put("channel_timeout_ms", 10000L);
+        configMap.put("parallelism", 1);
+        ReadonlyConfig readonlyConfig = ReadonlyConfig.fromMap(configMap);
+        MilvusCdcSourceConfig cdcConfig = MilvusCdcSourceConfig.of(readonlyConfig);
+        return new GrpcReplicateCdcStrategy(cdcConfig);
+    }
+
+    /**
+     * Run a snapshot read via any {@link CdcStrategy}: poll all rows with id &gt; -1 until
+     * exhausted. Strategy-agnostic version of {@link #runSnapshot}.
+     */
+    protected List<SeaTunnelRowWithPosition> runCdcSnapshot(
+            CdcStrategy strategy, String collectionName, int expectedRows) throws Exception {
+        MilvusCdcSourceSplit split =
+                MilvusCdcSourceSplit.builder()
+                        .splitId("snap-" + collectionName)
+                        .collectionName(collectionName)
+                        .snapshot(true)
+                        .startId(-1L)
+                        .endId(Long.MAX_VALUE)
+                        .offset(0L)
+                        .limit(-1L)
+                        .build();
+
+        List<SeaTunnelRowWithPosition> all = new ArrayList<>();
+        ReplicatePosition pos = null;
+        for (int poll = 0; poll < 50; poll++) {
+            List<SeaTunnelRowWithPosition> batch = strategy.pollChanges(split, pos);
+            if (batch.isEmpty()) {
+                break;
+            }
+            all.addAll(batch);
+            pos = batch.get(batch.size() - 1).getPosition();
+            if (all.size() >= expectedRows) {
+                break;
+            }
+        }
+        return all;
+    }
+
+    /**
+     * Run a single incremental poll via any {@link CdcStrategy} from the given watermark.
+     * Strategy-agnostic version of {@link #runIncrementalPoll}.
+     */
+    protected List<SeaTunnelRowWithPosition> runCdcIncrementalPoll(
+            CdcStrategy strategy, String collectionName, long watermark) throws Exception {
+        MilvusCdcSourceSplit split =
+                MilvusCdcSourceSplit.builder()
+                        .splitId("inc-" + collectionName)
+                        .collectionName(collectionName)
+                        .snapshot(false)
+                        .startId(watermark)
+                        .endId(Long.MAX_VALUE)
+                        .build();
+        return strategy.pollChanges(split, null);
+    }
+
+    /**
      * Run a snapshot read: poll all rows with id &gt; -1 until exhausted. Returns all collected
      * rows.
      */
