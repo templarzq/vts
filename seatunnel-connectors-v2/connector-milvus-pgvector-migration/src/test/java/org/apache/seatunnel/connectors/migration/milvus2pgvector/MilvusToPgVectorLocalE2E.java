@@ -232,7 +232,7 @@ public class MilvusToPgVectorLocalE2E {
             rows.add(row);
         }
         milvusClient.insert(
-                InsertReq.builder().collectionName(COLLECTION).data(rows).build());
+                InsertReq.builder().collectionName(COLLECTION).data((java.util.List) rows).build());
         log.info("Inserted {} rows into '{}'", ROW_COUNT, COLLECTION);
 
         // 4. Load collection

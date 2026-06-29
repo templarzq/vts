@@ -1,0 +1,94 @@
+# =============================================================================
+# Milvus CDC → PgVector E2E Test Environment Configuration
+# =============================================================================
+# This file declares the required environment for running the CDC E2E test
+# suite. Values can be overridden via system properties (-D...) at runtime.
+#
+# Prerequisites (manual deployment):
+#   1. Milvus 2.6.x (docker-compose at /home/zhangqiang/project/vts/vts.yaml)
+#        - etcd v3.5.5
+#        - minio (RELEASE.2025-04-22T22-12-26Z)
+#        - milvus-standalone v2.6.9  (port 19530)
+#   2. PostgreSQL 16 + pgvector extension (data dir: /home/zhangqiang/pg/data)
+#        - user: zhangqiang (trust auth on localhost)
+#        - port: 5432
+#        - extension: vector (CREATE EXTENSION IF NOT EXISTS vector)
+#
+# Run tests with:
+#   ./mvnw test -pl connector-milvus-pgvector-migration \
+#       -Dtest=MilvusCdcFullSyncE2E,MilvusCdcIncrementalE2E,MilvusCdcResilienceE2E \
+#       -Dmigration.cdc.e2e.enabled=true \
+#       -Dmaven.test.skip=false -DskipUT=false -DfailIfNoTests=false
+# =============================================================================
+
+environment:
+  milvus:
+    version: "2.6.9"
+    image: "milvusdb/milvus:v2.6.9"
+    deployment: "docker-compose standalone"
+    compose_file: "/home/zhangqiang/project/vts/vts.yaml"
+    endpoint: "http://localhost:19530"
+    token: ""
+    database: "default"
+    health_check: "http://localhost:9091/healthz"
+
+  postgresql:
+    version: "16"
+    pgvector_version: ">=0.7.0"
+    data_dir: "/home/zhangqiang/pg/data"
+    host: "localhost"
+    port: 5432
+    user: "zhangqiang"
+    password: ""
+    admin_database: "postgres"      # used to CREATE/DROP test databases
+    test_database: "vts_cdc_e2e"   # auto-created/dropped by test base
+    schema: "public"
+    extension: "vector"
+
+test_parameters:
+  # Dataset scales — exercised across small/medium/large to validate scalability
+  scales:
+    small:
+      row_count: 100
+      vector_dim: 8
+      description: "smoke test scale — fast feedback"
+    medium:
+      row_count: 1000
+      vector_dim: 128
+      description: "typical workload scale"
+    large:
+      row_count: 5000
+      vector_dim: 256
+      description: "stress scale — exercises pagination and back-pressure"
+
+  # Incremental CDC batches
+  incremental:
+    insert_count: 200
+    update_count: 100
+    delete_count: 50
+
+  # Validation thresholds
+  validation:
+    similarity_threshold: 0.9999    # cosine similarity between Milvus & pgvector vectors
+    row_count_strict_match: true    # require exact row count match for snapshot phase
+    sample_size: 100                # rows sampled for vector similarity check
+
+  # Resilience scenarios
+  resilience:
+    network_recovery_retries: 3
+    network_recovery_backoff_ms: 2000
+    resume_checkpoint_tolerance_rows: 0   # no row loss after resume
+    malformed_vector_expect_error: true
+
+  # Performance budgets (soft assertions — recorded, not enforced strictly)
+  performance_budgets:
+    snapshot_throughput_rows_per_sec_min: 50
+    incremental_latency_p99_ms_max: 5000
+    success_rate_min: 0.99
+
+# Reporting
+reporting:
+  output_dir: "target/cdc-e2e-reports"
+  formats: ["json", "console"]
+  include_performance_data: true
+  include_problem_analysis: true

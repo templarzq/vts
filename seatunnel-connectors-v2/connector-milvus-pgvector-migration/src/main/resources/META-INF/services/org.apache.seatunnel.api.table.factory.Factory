@@ -1,0 +1,3 @@
+org.apache.seatunnel.connectors.migration.milvus2pgvector.transform.MilvusToPgVectorTransformFactory
+org.apache.seatunnel.connectors.migration.milvus2pgvector.validation.VectorValidationTransformFactory
+org.apache.seatunnel.connectors.migration.milvus2pgvector.cdc.MilvusCdcSourceFactory

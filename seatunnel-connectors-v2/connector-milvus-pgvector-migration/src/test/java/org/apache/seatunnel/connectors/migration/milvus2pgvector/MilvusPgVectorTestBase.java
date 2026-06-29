@@ -194,7 +194,7 @@ public abstract class MilvusPgVectorTestBase {
         milvusClient.insert(
                 io.milvus.v2.service.vector.request.InsertReq.builder()
                         .collectionName(collectionName)
-                        .data(rows)
+                        .data((java.util.List) rows)
                         .build());
         log.info("Inserted {} rows into '{}'", count, collectionName);
     }
