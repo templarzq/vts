@@ -245,10 +245,32 @@ public class MilvusCdcSourceReader implements SourceReader<SeaTunnelRow, MilvusC
 
     /**
      * Create the appropriate CDC strategy based on configuration.
-     * Falls back to polling incremental if the gRPC strategy is not available.
+     * Falls back to polling incremental if the requested strategy is not available.
      */
     private CdcStrategy createCdcStrategy() {
         String strategyType = cdcConfig.getCdcStrategy();
+
+        if ("event_stream".equalsIgnoreCase(strategyType)) {
+            if (cdcConfig.getCdcPchannel() == null || cdcConfig.getCdcPchannel().isEmpty()) {
+                log.error("cdc_strategy=event_stream requires cdc_pchannel to be set; "
+                        + "falling back to polling_incremental strategy");
+            } else {
+                CdcEventStreamStrategy streamStrategy =
+                        new CdcEventStreamStrategy(cdcConfig, collectionDesc);
+                if (streamStrategy.isAvailable()) {
+                    log.info("Using event_stream CDC strategy (pchannel={})",
+                            cdcConfig.getCdcPchannel());
+                    return streamStrategy;
+                }
+                log.warn("event_stream CDC not available (GetReplicateInfo returned no checkpoint); "
+                        + "falling back to polling_incremental strategy");
+                try {
+                    streamStrategy.close();
+                } catch (Exception e) {
+                    log.debug("Error closing unavailable event_stream strategy", e);
+                }
+            }
+        }
 
         if ("grpc_replicate".equalsIgnoreCase(strategyType)) {
             GrpcReplicateCdcStrategy grpcStrategy =

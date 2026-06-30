@@ -65,7 +65,10 @@ public class MilvusCdcSourceFactory implements ChangeStreamTableSourceFactory {
                         MilvusCdcSourceConfig.CLIENT_KEY_PATH,
                         MilvusCdcSourceConfig.CA_PEM_PATH,
                         MilvusCdcSourceConfig.SERVER_NAME,
-                        MilvusCdcSourceConfig.PARALLELISM)
+                        MilvusCdcSourceConfig.PARALLELISM,
+                        MilvusCdcSourceConfig.CDC_PCHANNEL,
+                        MilvusCdcSourceConfig.CDC_SOURCE_CLUSTER_ID,
+                        MilvusCdcSourceConfig.CDC_START_MESSAGE_ID)
                 .build();
     }
 

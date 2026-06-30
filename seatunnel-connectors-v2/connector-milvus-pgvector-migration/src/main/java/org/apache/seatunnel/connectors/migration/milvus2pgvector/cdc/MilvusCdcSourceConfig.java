@@ -92,7 +92,11 @@ public class MilvusCdcSourceConfig implements Serializable {
                     .stringType()
                     .defaultValue("polling_incremental")
                     .withDescription(
-                            "CDC strategy - \"grpc_replicate\" or \"polling_incremental\"");
+                            "CDC strategy - one of \"polling_incremental\" (default, PK-based "
+                                    + "query iteration), \"grpc_replicate\" (PK-based query with "
+                                    + "replicate position tracking), or \"event_stream\" (real "
+                                    + "WAL event capture via DumpMessages gRPC; supports delete "
+                                    + "and same-PK update detection)");
 
     public static final Option<String> PRIMARY_KEY_FIELD =
             Options.key("primary_key_field")
@@ -143,6 +147,50 @@ public class MilvusCdcSourceConfig implements Serializable {
                     .defaultValue(1)
                     .withDescription("Reader parallelism (snapshot phase only)");
 
+    /**
+     * Physical channel name (pchannel) for the {@code event_stream} CDC strategy.
+     * Required when {@code cdc_strategy=event_stream}. For standalone Milvus the
+     * default pchannel is {@code <cluster-prefix>-rootcoord-dml_0} (cluster prefix
+     * defaults to {@code by-dev}).
+     */
+    public static final Option<String> CDC_PCHANNEL =
+            Options.key("cdc_pchannel")
+                    .stringType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "Physical channel name for event_stream CDC strategy. "
+                                    + "Required when cdc_strategy=event_stream. "
+                                    + "Default for standalone Milvus: <cluster-prefix>-rootcoord-dml_0 "
+                                    + "(cluster prefix default is 'by-dev').");
+
+    /**
+     * Source cluster ID used by {@code GetReplicateInfo} when bootstrapping the
+     * event_stream CDC stream. Optional; if blank the {@code source_cluster_id}
+     * field is omitted from the request and the server uses its default.
+     */
+    public static final Option<String> CDC_SOURCE_CLUSTER_ID =
+            Options.key("cdc_source_cluster_id")
+                    .stringType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "Source cluster ID used by GetReplicateInfo when bootstrapping "
+                                    + "the event_stream CDC. Optional; if blank, the source_cluster_id "
+                                    + "field is omitted from the request.");
+
+    /**
+     * Optional explicit start message ID (string form) for the event_stream
+     * CDC. When set, overrides the {@code GetReplicateInfo} bootstrap
+     * checkpoint. Use only when you know the exact WAL position to resume from.
+     */
+    public static final Option<String> CDC_START_MESSAGE_ID =
+            Options.key("cdc_start_message_id")
+                    .stringType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "Optional explicit start message ID (string form) for event_stream CDC. "
+                                    + "Overrides the GetReplicateInfo bootstrap checkpoint. "
+                                    + "Use only when you know the exact WAL position to resume from.");
+
     private String url;
     private String token;
     private String database;
@@ -160,6 +208,9 @@ public class MilvusCdcSourceConfig implements Serializable {
     private String caPemPath;
     private String serverName;
     private Integer parallelism;
+    private String cdcPchannel;
+    private String cdcSourceClusterId;
+    private String cdcStartMessageId;
 
     public static MilvusCdcSourceConfig of(ReadonlyConfig config) {
         return MilvusCdcSourceConfig.builder()
@@ -180,6 +231,9 @@ public class MilvusCdcSourceConfig implements Serializable {
                 .caPemPath(config.get(CA_PEM_PATH))
                 .serverName(config.get(SERVER_NAME))
                 .parallelism(config.get(PARALLELISM))
+                .cdcPchannel(config.get(CDC_PCHANNEL))
+                .cdcSourceClusterId(config.get(CDC_SOURCE_CLUSTER_ID))
+                .cdcStartMessageId(config.get(CDC_START_MESSAGE_ID))
                 .build();
     }
 }

@@ -76,6 +76,11 @@ public class CdcTestReport {
         } catch (IOException e) {
             log.warn("Failed to write JSON report: {}", e.getMessage());
         }
+        try {
+            writeMarkdownReport();
+        } catch (IOException e) {
+            log.warn("Failed to write Markdown report: {}", e.getMessage());
+        }
         log.info("{}", formatConsoleSummary());
     }
 
@@ -212,6 +217,96 @@ public class CdcTestReport {
         json.append("}\n");
         Files.write(file, json.toString().getBytes());
         log.info("CDC E2E report written to {}", file.toAbsolutePath());
+    }
+
+    private void writeMarkdownReport() throws IOException {
+        Files.createDirectories(outputDir);
+        Path file = outputDir.resolve("CDC-E2E-Test-Report.md");
+        StringBuilder md = new StringBuilder();
+
+        md.append("# Milvus CDC E2E 测试报告\n\n");
+        md.append("## 1. 测试环境\n\n");
+        md.append("| 配置项 | 值 |\n");
+        md.append("|--------|----|\n");
+        md.append("| 环境 | ").append(environmentLabel).append(" |\n");
+        md.append("| 生成时间 | ").append(Instant.now()).append(" |\n");
+        md.append("| 向量相似度阈值 | ≥ ").append(similarityThreshold).append(" |\n");
+        md.append("| 成功率阈值 | ≥ ").append(String.format("%.0f%%", minSuccessRate * 100)).append(" |\n");
+        md.append("| 快照吞吐量阈值 | ≥ ").append(snapshotThroughputMinRowsPerSec).append(" rows/s |\n");
+        md.append("| 增量延迟P99阈值 | ≤ ").append(incrementalLatencyP99MaxMs).append("ms |\n\n");
+
+        md.append("## 2. 测试场景汇总\n\n");
+        md.append("| 场景名称 | 状态 | 耗时 | 吞吐量 | 成功率 | P99延迟 | P99同步延迟 | 期望行数 | 实际行数 | 失败行数 | 异常数 |\n");
+        md.append("|----------|------|------|--------|--------|---------|-------------|----------|----------|----------|--------|\n");
+        for (ScenarioResult s : scenarioResults) {
+            md.append("| ").append(s.scenarioName).append(" | ");
+            md.append(s.passed ? "✅ PASS" : "❌ FAIL").append(" | ");
+            md.append(s.totalDurationMs).append("ms | ");
+            md.append(String.format("%.1f", s.throughputRowsPerSec)).append("/s | ");
+            md.append(String.format("%.0f%%", s.successRate * 100)).append(" | ");
+            md.append(s.p99LatencyMs).append("ms | ");
+            md.append(s.p99SyncDelayMs).append("ms | ");
+            md.append(s.expectedRows).append(" | ");
+            md.append(s.actualRows).append(" | ");
+            md.append(s.failedRows).append(" | ");
+            md.append(s.anomalyCount).append(" |\n");
+        }
+        md.append("\n");
+
+        md.append("## 3. 向量相似度分析\n\n");
+        md.append("| 场景名称 | 平均相似度 | 最小相似度 |\n");
+        md.append("|----------|------------|------------|\n");
+        for (ScenarioResult s : scenarioResults) {
+            md.append("| ").append(s.scenarioName).append(" | ");
+            md.append(String.format("%.6f", s.avgSimilarity)).append(" | ");
+            md.append(String.format("%.6f", s.minSimilarity)).append(" |\n");
+        }
+        md.append("\n");
+
+        md.append("## 4. 问题分析\n\n");
+        if (problemAnalysis.isEmpty()) {
+            md.append("所有测试场景均通过阈值检查，无异常记录。\n\n");
+        } else {
+            md.append("共记录 **").append(problemAnalysis.size()).append("** 个异常/限制说明：\n\n");
+            for (String p : problemAnalysis) {
+                md.append("- ").append(p).append("\n");
+            }
+            md.append("\n");
+        }
+
+        md.append("## 5. 策略说明\n\n");
+        md.append("### 5.1 PollingIncrementalCdcStrategy\n\n");
+        md.append("基于主键水位线的轮询策略：\n");
+        md.append("- 使用 `id > watermark` 表达式查询增量数据\n");
+        md.append("- **限制**：无法检测删除操作（已删除的行不会出现在查询结果中）\n");
+        md.append("- **限制**：无法检测同主键更新（更新不改变主键值，`id > watermark` 无法匹配）\n");
+        md.append("- 适用场景：纯插入型数据流，或配合外部全量扫描补偿机制\n\n");
+
+        md.append("### 5.2 GrpcReplicateCdcStrategy\n\n");
+        md.append("基于 Milvus SDK 的策略实现：\n");
+        md.append("- 使用 `getLoadState()` 作为可用性探测\n");
+        md.append("- 数据检索仍采用 PK 轮询（与 PollingIncrementalCdcStrategy 相同）\n");
+        md.append("- **限制**：同样无法检测删除和同主键更新\n");
+        md.append("- 保留为独立实现，以便未来接入 Milvus 公开 CDC订阅 API\n\n");
+
+        md.append("## 6. 结论\n\n");
+        int passedCount = 0;
+        for (ScenarioResult s : scenarioResults) {
+            if (s.passed) passedCount++;
+        }
+        md.append("- 测试场景总数：").append(scenarioResults.size()).append("\n");
+        md.append("- 通过场景数：").append(passedCount).append("\n");
+        md.append("- 失败场景数：").append(scenarioResults.size() - passedCount).append("\n");
+        if (passedCount == scenarioResults.size()) {
+            md.append("- **结论**：所有测试场景通过 ✅\n");
+        } else {
+            md.append("- **结论**：部分场景未通过阈值检查，请查看问题分析章节 ❌\n");
+        }
+        md.append("\n---\n");
+        md.append("*报告自动生成于 ").append(Instant.now()).append("*\n");
+
+        Files.write(file, md.toString().getBytes());
+        log.info("CDC E2E Markdown report written to {}", file.toAbsolutePath());
     }
 
     public String formatConsoleSummary() {

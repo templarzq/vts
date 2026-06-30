@@ -1,0 +1,97 @@
+syntax = "proto3";
+
+package milvus.proto.milvus;
+
+option java_multiple_files = true;
+option java_package = "org.apache.seatunnel.connectors.cdc.milvus.proto";
+option java_outer_classname = "MilvusCdcProto";
+
+// WALName mirrors milvus.proto.common.WALName. It identifies the underlying
+// WAL implementation that produced a MessageID. The values must stay in sync
+// with the server-side enum.
+enum WALName {
+    Unknown = 0;
+    RocksMQ = 1;
+    Pulsar = 2;
+    Kafka = 3;
+    WoodPecker = 4;
+    Test = 999;
+}
+
+// MessageID is the identifier of a message within a PChannel. The id field
+// carries the WAL-specific serialization (e.g. RocksDB MessageID, Pulsar
+// MessageId, Kafka offset). Its content is opaque to the client; the client
+// only stores it and passes it back to DumpMessages as the start position.
+message MessageID {
+    string id = 1;
+    WALName wALName = 2;
+}
+
+// ImmutableMessage mirrors milvus.proto.common.ImmutableMessage. It is the
+// envelope returned by DumpMessages. The payload field contains the raw
+// serialized message body (InsertRequest / DeleteRequest / etc.) and the
+// properties map carries metadata such as:
+//   - "messages.type":       MessageType name (e.g. "Insert", "Delete")
+//   - "messages.collection": collection ID (string form)
+//   - "messages.vchannel":  virtual channel name (e.g. "<collection>_<partition>")
+//   - "messages.timetick":   message timetick (string form of uint64)
+message ImmutableMessage {
+    MessageID id = 1;
+    bytes payload = 2;
+    map<string, string> properties = 3;
+}
+
+// ReplicateCheckpoint mirrors milvus.proto.common.ReplicateCheckpoint. It is
+// returned by GetReplicateInfo and provides the initial start position for a
+// CDC stream. The message_id field holds the serialized MessageID bytes
+// (WAL-specific) and must be wrapped in a MessageID proto before being passed
+// to DumpMessagesRequest.start_message_id.
+message ReplicateCheckpoint {
+    string cluster_id = 1;
+    string pchannel = 2;
+    bytes message_id = 3;
+    uint64 time_tick = 4;
+}
+
+message GetReplicateInfoRequest {
+    string source_cluster_id = 1;
+    string target_pchannel = 2;
+}
+
+message GetReplicateInfoResponse {
+    ReplicateCheckpoint checkpoint = 1;
+    ReplicateCheckpoint salvage_checkpoint = 2;
+}
+
+message DumpMessagesRequest {
+    string pchannel = 1;
+    MessageID start_message_id = 2;
+    uint64 start_timetick = 3;
+    uint64 end_timetick = 4;
+}
+
+// DumpMessagesResponse is a oneof: each frame is either a real WAL message
+// or a terminal Status frame signalling an error or end-of-stream.
+message DumpMessagesResponse {
+    oneof response {
+        ImmutableMessage message = 1;
+        Status status = 2;
+    }
+}
+
+message Status {
+    int32 error_code = 1;
+    string reason = 2;
+    int32 code = 3;
+    bool retriable = 4;
+    string detail = 5;
+}
+
+// MilvusService declares only the CDC-related RPCs that this module needs.
+// The service name and package match the server's full gRPC method path
+// (e.g. /milvus.proto.milvus.MilvusService/DumpMessages) so generated stubs
+// are wire-compatible with the real Milvus server.
+service MilvusService {
+    rpc GetReplicateInfo(GetReplicateInfoRequest) returns (GetReplicateInfoResponse) {}
+    rpc DumpMessages(DumpMessagesRequest) returns (stream DumpMessagesResponse) {}
+}

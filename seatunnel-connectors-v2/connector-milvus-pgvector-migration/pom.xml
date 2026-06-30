@@ -56,6 +56,38 @@
             <version>${project.version}</version>
         </dependency>
 
+        <!--
+          gRPC and protobuf dependencies for the self-generated Milvus CDC
+          DumpMessages stub. These are NOT relocated at compile time; the
+          maven-shade-plugin relocations below rewrite them to match the
+          SDK's shaded classes at runtime.
+        -->
+        <dependency>
+            <groupId>io.grpc</groupId>
+            <artifactId>grpc-netty-shaded</artifactId>
+            <version>${grpc.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>io.grpc</groupId>
+            <artifactId>grpc-protobuf</artifactId>
+            <version>${grpc.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>io.grpc</groupId>
+            <artifactId>grpc-stub</artifactId>
+            <version>${grpc.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>com.google.protobuf</groupId>
+            <artifactId>protobuf-java</artifactId>
+            <version>${protobuf.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>javax.annotation</groupId>
+            <artifactId>javax.annotation-api</artifactId>
+            <version>1.3.2</version>
+        </dependency>
+
         <!-- Test dependencies -->
         <dependency>
             <groupId>org.testcontainers</groupId>
@@ -93,10 +125,51 @@
             <version>4.13.2</version>
             <scope>test</scope>
         </dependency>
+        <dependency>
+            <groupId>org.mockito</groupId>
+            <artifactId>mockito-junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 
     <build>
+        <extensions>
+            <!--
+              OS detector extension, required by protobuf-maven-plugin to
+              resolve the protoc binary for the current platform.
+            -->
+            <extension>
+                <groupId>kr.motd.maven</groupId>
+                <artifactId>os-maven-plugin</artifactId>
+                <version>1.7.1</version>
+            </extension>
+        </extensions>
         <plugins>
+            <!--
+              Generate Java gRPC stubs and protobuf message classes from
+              src/main/proto/milvus_cdc.proto. The generated stubs target
+              the un-relocated io.grpc / com.google.protobuf packages; the
+              maven-shade-plugin rewrites them at packaging time so they
+              align with the SDK's shaded runtime classes.
+            -->
+            <plugin>
+                <groupId>org.xolstice.maven.plugins</groupId>
+                <artifactId>protobuf-maven-plugin</artifactId>
+                <version>0.6.1</version>
+                <configuration>
+                    <protocArtifact>com.google.protobuf:protoc:${protobuf.version}:exe:${os.detected.classifier}</protocArtifact>
+                    <pluginId>grpc-java</pluginId>
+                    <pluginArtifact>io.grpc:protoc-gen-grpc-java:${grpc.version}:exe:${os.detected.classifier}</pluginArtifact>
+                </configuration>
+                <executions>
+                    <execution>
+                        <goals>
+                            <goal>compile</goal>
+                            <goal>compile-custom</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-shade-plugin</artifactId>
@@ -130,6 +203,25 @@
                             </excludes>
                         </filter>
                     </filters>
+                    <!--
+                      Apply the same relocations as connector-milvus so the
+                      migration module's shaded JAR is consistent with the
+                      SDK's shaded gRPC/protobuf classes at runtime.
+                    -->
+                    <relocations>
+                        <relocation>
+                            <pattern>com.google</pattern>
+                            <shadedPattern>milvus.com.google</shadedPattern>
+                        </relocation>
+                        <relocation>
+                            <pattern>io.grpc</pattern>
+                            <shadedPattern>milvus.io.grpc</shadedPattern>
+                        </relocation>
+                        <relocation>
+                            <pattern>org.locationtech.jts</pattern>
+                            <shadedPattern>milvus.org.locationtech.jts</shadedPattern>
+                        </relocation>
+                    </relocations>
                 </configuration>
             </plugin>
         </plugins>
