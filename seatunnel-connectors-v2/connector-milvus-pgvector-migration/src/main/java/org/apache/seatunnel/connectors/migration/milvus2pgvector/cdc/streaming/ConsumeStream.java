@@ -1,0 +1,247 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.seatunnel.connectors.migration.milvus2pgvector.cdc.streaming;
+
+import org.apache.seatunnel.connectors.streaming.proto.ConsumeRequest;
+import org.apache.seatunnel.connectors.streaming.proto.ConsumeResponse;
+import org.apache.seatunnel.connectors.streaming.proto.CreateVChannelConsumerResponse;
+import org.apache.seatunnel.connectors.streaming.proto.ImmutableMessage;
+import org.apache.seatunnel.connectors.streaming.proto.StreamingNodeHandlerServiceGrpc;
+
+import io.grpc.Status;
+import io.grpc.StatusRuntimeException;
+import io.grpc.stub.StreamObserver;
+import lombok.extern.slf4j.Slf4j;
+
+import java.util.Iterator;
+import java.util.NoSuchElementException;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
+
+/**
+ * ConsumeStream wraps a bidirectional gRPC stream for reading WAL messages.
+ * The client sends control requests (CreateVChannelConsumer, CloseConsumer),
+ * and the server streams back ConsumeResponse messages containing ImmutableMessage.
+ *
+ * This class implements Iterator<ImmutableMessage> for easy consumption:
+ *   - hasNext() checks if there are more messages
+ *   - next() returns the next ImmutableMessage from the stream
+ *   - close() sends CloseConsumerRequest and terminates the stream
+ */
+@Slf4j
+public class ConsumeStream implements Iterator<ImmutableMessage>, AutoCloseable {
+
+    private final StreamingNodeHandlerServiceGrpc.StreamingNodeHandlerServiceStub asyncStub;
+    private final String pchannelName;
+
+    // Request observer for sending control requests to server
+    private StreamObserver<ConsumeRequest> requestObserver;
+
+    // Response queue for receiving messages from server
+    private final LinkedBlockingQueue<ImmutableMessage> messageQueue;
+
+    // Flag indicating if stream is still open
+    private volatile boolean isOpen = true;
+
+    // Error from server (if any)
+    private volatile Throwable streamError = null;
+
+    /**
+     * Constructor: creates a bidirectional stream and sends initial CreateVChannelConsumerRequest.
+     *
+     * @param asyncStub      gRPC async stub for StreamingNodeHandlerService
+     * @param createRequest  Initial ConsumeRequest (must be CreateVChannelConsumerRequest)
+     * @param pchannelName   PChannel name for logging
+     */
+    public ConsumeStream(
+            StreamingNodeHandlerServiceGrpc.StreamingNodeHandlerServiceStub asyncStub,
+            ConsumeRequest createRequest,
+            String pchannelName) {
+        this.asyncStub = asyncStub;
+        this.pchannelName = pchannelName;
+        this.messageQueue = new LinkedBlockingQueue<>(1000);  // Buffer size
+
+        // Create response observer for handling server responses
+        StreamObserver<ConsumeResponse> responseObserver = new StreamObserver<ConsumeResponse>() {
+            @Override
+            public void onNext(ConsumeResponse response) {
+                if (response.hasConsume()) {
+                    // Received a WAL message via ConsumeMessageReponse
+                    ImmutableMessage message = response.getConsume().getMessage();
+                    if (!messageQueue.offer(message)) {
+                        log.warn("Message queue full for pchannel={}, dropping message", pchannelName);
+                    }
+                } else if (response.hasCreate()) {
+                    // Consumer created successfully
+                    log.info("Consumer created successfully for pchannel={}, serverId={}",
+                            pchannelName, response.getCreate().getConsumerServerId());
+                } else if (response.hasCreateVchannel()) {
+                    CreateVChannelConsumerResponse vcResp = response.getCreateVchannel();
+                    if (vcResp.hasError()) {
+                        log.warn("CreateVChannelConsumer failed for pchannel={}: code={}, cause={}",
+                                pchannelName, vcResp.getError().getCode(), vcResp.getError().getCause());
+                    } else {
+                        log.info("VChannel consumer created for pchannel={}, consumerId={}",
+                                pchannelName, vcResp.getConsumerId());
+                    }
+                } else if (response.hasCloseVchannel()) {
+                    log.info("VChannel consumer closed for pchannel={}, consumerId={}",
+                            pchannelName, response.getCloseVchannel().getConsumerId());
+                } else if (response.hasClose()) {
+                    log.info("Consumer closed for pchannel={}", pchannelName);
+                }
+            }
+
+            @Override
+            public void onError(Throwable t) {
+                if (t instanceof StatusRuntimeException) {
+                    Status status = ((StatusRuntimeException) t).getStatus();
+                    log.error("Consume stream error for pchannel={}: code={}, description={}, cause={}",
+                            pchannelName, status.getCode(), status.getDescription(),
+                            status.getCause() != null ? status.getCause().getMessage() : "none");
+                } else {
+                    log.error("Consume stream error for pchannel={}: {}", pchannelName, t.getMessage());
+                }
+                streamError = t;
+                isOpen = false;
+            }
+
+            @Override
+            public void onCompleted() {
+                log.info("Consume stream completed for pchannel={}", pchannelName);
+                isOpen = false;
+            }
+        };
+
+        // Create bidirectional stream
+        this.requestObserver = asyncStub.consume(responseObserver);
+
+        // Send initial CreateVChannelConsumerRequest
+        try {
+            requestObserver.onNext(createRequest);
+            log.info("Sent CreateVChannelConsumerRequest for pchannel={}", pchannelName);
+        } catch (Exception e) {
+            log.error("Failed to send CreateVChannelConsumerRequest: {}", e.getMessage());
+            streamError = e;
+            isOpen = false;
+        }
+    }
+
+    /**
+     * Check if there are more messages in the queue.
+     * This method blocks briefly to wait for messages if the queue is empty but stream is still open.
+     *
+     * @return true if there are more messages, false if stream is closed and queue is empty
+     */
+    @Override
+    public boolean hasNext() {
+        if (!messageQueue.isEmpty()) {
+            return true;
+        }
+
+        if (!isOpen) {
+            // Stream closed, check if there was an error
+            if (streamError != null) {
+                throw new RuntimeException("Stream error: " + streamError.getMessage(), streamError);
+            }
+            return false;  // Stream completed normally
+        }
+
+        // Stream still open, wait briefly for messages
+        try {
+            ImmutableMessage msg = messageQueue.poll(100, TimeUnit.MILLISECONDS);
+            if (msg != null) {
+                // Put it back for next() to retrieve
+                messageQueue.put(msg);
+                return true;
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
+
+        // Still open but no message arrived in 100ms
+        return true;  // Assume more messages will come (stream still open)
+    }
+
+    /**
+     * Get the next ImmutableMessage from the stream.
+     * This method blocks until a message is available or stream closes.
+     *
+     * @return next ImmutableMessage
+     * @throws NoSuchElementException if stream is closed and queue is empty
+     */
+    @Override
+    public ImmutableMessage next() {
+        if (!hasNext()) {
+            throw new NoSuchElementException("Stream closed and queue empty for pchannel=" + pchannelName);
+        }
+
+        try {
+            ImmutableMessage message = messageQueue.poll(5, TimeUnit.SECONDS);  // Block up to 5s
+            if (message != null) {
+                return message;
+            } else {
+                throw new NoSuchElementException("No message available within timeout for pchannel=" + pchannelName);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException("Interrupted while waiting for message", e);
+        }
+    }
+
+    /**
+     * Close the stream by sending CloseConsumerRequest.
+     */
+    @Override
+    public void close() {
+        if (requestObserver != null && isOpen) {
+            try {
+                // Send close request
+                ConsumeRequest closeRequest = ConsumeRequest.newBuilder()
+                        .setClose(org.apache.seatunnel.connectors.streaming.proto.CloseConsumerRequest.newBuilder().build())
+                        .build();
+                requestObserver.onNext(closeRequest);
+
+                // Close request stream
+                requestObserver.onCompleted();
+
+                log.info("Sent CloseConsumerRequest for pchannel={}", pchannelName);
+            } catch (Exception e) {
+                log.warn("Error closing ConsumeStream for pchannel={}: {}", pchannelName, e.getMessage());
+            } finally {
+                isOpen = false;
+                requestObserver = null;
+            }
+        }
+    }
+
+    /**
+     * Check if stream is still open (active).
+     */
+    public boolean isOpen() {
+        return isOpen;
+    }
+
+    /**
+     * Get stream error (if any).
+     */
+    public Throwable getStreamError() {
+        return streamError;
+    }
+}

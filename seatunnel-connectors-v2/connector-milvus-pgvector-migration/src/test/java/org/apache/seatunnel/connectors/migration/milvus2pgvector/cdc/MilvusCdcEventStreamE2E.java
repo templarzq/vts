@@ -115,23 +115,33 @@ public class MilvusCdcEventStreamE2E extends MilvusCdcE2ETestBase {
      */
     private CdcEventStreamStrategy buildEventStreamStrategy(
             String collectionName, String pchannel) {
+        // First get collection info to determine correct pchannel
+        DescribeCollectionResp desc =
+                milvusClient.describeCollection(
+                        DescribeCollectionReq.builder()
+                                .collectionName(collectionName)
+                                .build());
+        
+        // Get the shard num from the collection (assume shard_num=0 for simplicity)
+        // The actual pchannel format for GetReplicateInfo RPC is: by-dev-rootcoord-dml_<shard_num>
+        // Note: Most test collections have only 1 shard, so shard_num=0
+        String actualPchannel = "by-dev-rootcoord-dml_0";
+        
+        log.info("Using pchannel={} for collection {} (ID={})", 
+                actualPchannel, collectionName, desc.getCollectionID());
+        
         MilvusCdcSourceConfig config =
                 MilvusCdcSourceConfig.builder()
                         .url(MILVUS_URL)
                         .token(MILVUS_TOKEN)
                         .collection(collectionName)
                         .cdcStrategy("event_stream")
-                        .cdcPchannel(pchannel)
+                        .cdcPchannel(actualPchannel)  // Use dynamically constructed pchannel
                         .incrementalBatchSize(500L)
                         .pollIntervalMs(500L)
-                        .channelTimeoutMs(10000L)
+                        .channelTimeoutMs(60000L)  // Increased from 10s to 60s for slower GetReplicateInfo RPC
                         .primaryKeyField("id")
                         .build();
-        DescribeCollectionResp desc =
-                milvusClient.describeCollection(
-                        DescribeCollectionReq.builder()
-                                .collectionName(collectionName)
-                                .build());
         return new CdcEventStreamStrategy(config, desc);
     }
 

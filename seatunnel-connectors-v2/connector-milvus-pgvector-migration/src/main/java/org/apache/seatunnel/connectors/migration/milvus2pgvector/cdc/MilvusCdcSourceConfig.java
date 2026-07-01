@@ -98,6 +98,23 @@ public class MilvusCdcSourceConfig implements Serializable {
                                     + "WAL event capture via DumpMessages gRPC; supports delete "
                                     + "and same-PK update detection)");
 
+    public static final Option<String> STREAMING_NODE_ADDRESS =
+            Options.key("streaming_node_address")
+                    .stringType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "StreamingNode address for event_stream V2 strategy (e.g., 'localhost:19531'). "
+                                    + "If not set, defaults to Milvus URL. Used for StreamingNode gRPC.");
+
+    public static final Option<Boolean> CDC_USE_STREAMING_NODE =
+            Options.key("cdc_use_streaming_node")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withDescription(
+                            "Use StreamingNode gRPC for event_stream strategy (recommended). "
+                                    + "If true, uses StreamingNodeHandlerService.Consume; "
+                                    + "if false, uses legacy DumpMessages API (requires replication topology).");
+
     public static final Option<String> PRIMARY_KEY_FIELD =
             Options.key("primary_key_field")
                     .stringType()
@@ -211,6 +228,8 @@ public class MilvusCdcSourceConfig implements Serializable {
     private String cdcPchannel;
     private String cdcSourceClusterId;
     private String cdcStartMessageId;
+    private String streamingNodeAddress;
+    private Boolean cdcUseStreamingNode;
 
     public static MilvusCdcSourceConfig of(ReadonlyConfig config) {
         return MilvusCdcSourceConfig.builder()
@@ -234,6 +253,8 @@ public class MilvusCdcSourceConfig implements Serializable {
                 .cdcPchannel(config.get(CDC_PCHANNEL))
                 .cdcSourceClusterId(config.get(CDC_SOURCE_CLUSTER_ID))
                 .cdcStartMessageId(config.get(CDC_START_MESSAGE_ID))
+                .streamingNodeAddress(config.get(STREAMING_NODE_ADDRESS))
+                .cdcUseStreamingNode(config.get(CDC_USE_STREAMING_NODE))
                 .build();
     }
 }

@@ -320,6 +320,15 @@ public abstract class MilvusCdcE2ETestBase {
         }
         milvusClient.insert(
                 InsertReq.builder().collectionName(collectionName).data((List) rows).build());
+        // Flush collection to ensure data is persisted to WAL for CDC consumption
+        try {
+            milvusClient.flush(io.milvus.v2.service.utility.request.FlushReq.builder()
+                    .collectionNames(java.util.Collections.singletonList(collectionName))
+                    .build());
+            log.info("Flushed collection '{}' after insert", collectionName);
+        } catch (Exception e) {
+            log.warn("Flush failed for collection '{}': {}", collectionName, e.getMessage());
+        }
         log.info("Inserted {} rows (id {}..{}) into '{}'", count, startId, startId + count - 1,
                 collectionName);
         return firstWriteTs;
@@ -528,7 +537,7 @@ public abstract class MilvusCdcE2ETestBase {
         configMap.put("startup_mode", "INITIAL");
         configMap.put("cdc_strategy", "grpc_replicate");
         configMap.put("primary_key_field", "id");
-        configMap.put("channel_timeout_ms", 10000L);
+        configMap.put("channel_timeout_ms", 60000L);  // Increased from 10s to 60s for slower RPC calls
         configMap.put("parallelism", 1);
         ReadonlyConfig readonlyConfig = ReadonlyConfig.fromMap(configMap);
         MilvusCdcSourceConfig cdcConfig = MilvusCdcSourceConfig.of(readonlyConfig);

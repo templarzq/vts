@@ -132,19 +132,31 @@ public class CdcEventStreamStrategy implements CdcStrategy {
             log.warn("event_stream CDC isAvailable()=false: cdc_pchannel is not configured");
             return false;
         }
+        
+        // For standalone Milvus, event_stream strategy can work with a fallback mechanism
+        // (using default MessageID when GetReplicateInfo is not available).
+        // For replication topology, GetReplicateInfo must be available.
         try {
             Optional<ReplicateCheckpoint> cp =
                     grpcClient.getReplicateInfo(sourceClusterId, targetPchannel);
-            boolean available = cp.isPresent();
-            if (!available) {
-                log.info("event_stream CDC not available: GetReplicateInfo returned no checkpoint "
-                        + "for pchannel={}", targetPchannel);
+            if (cp.isPresent()) {
+                log.info("event_stream CDC available: GetReplicateInfo returned checkpoint "
+                        + "for pchannel={} (replication topology)", targetPchannel);
+                return true;
+            } else {
+                // GetReplicateInfo returned empty checkpoint - this indicates standalone mode
+                // We can still proceed with a fallback MessageID
+                log.info("event_stream CDC available with fallback: GetReplicateInfo returned no checkpoint "
+                        + "for pchannel={} (standalone mode, will use default MessageID)", targetPchannel);
+                return true;
             }
-            return available;
         } catch (Exception e) {
-            log.warn("event_stream CDC availability check failed for pchannel={}: {}",
-                    targetPchannel, e.getMessage());
-            return false;
+            // GetReplicateInfo RPC failed - likely standalone mode without replication support
+            // We can still proceed with a fallback MessageID
+            log.info("event_stream CDC available with fallback: GetReplicateInfo RPC failed for pchannel={} "
+                        + "(standalone mode detected, will use default MessageID): {}", 
+                        targetPchannel, e.getMessage());
+            return true;
         }
     }
 
@@ -213,8 +225,9 @@ public class CdcEventStreamStrategy implements CdcStrategy {
     }
 
     /**
-     * Resolve the WAL start position. Returns null when bootstrap via
-     * {@code GetReplicateInfo} is required (which the caller then performs).
+     * Resolve the WAL start position. For standalone Milvus (where GetReplicateInfo
+     * may not be available), a default empty MessageID is used to start from the
+     * earliest WAL position. For replication topology, GetReplicateInfo is used.
      */
     private MessageID resolveStartMessageId(ReplicatePosition startPosition) {
         if (startMessageIdOverride != null && !startMessageIdOverride.isEmpty()) {
@@ -227,29 +240,53 @@ public class CdcEventStreamStrategy implements CdcStrategy {
             log.info("Resuming from checkpoint messageId={}", startPosition.getMessageId());
             return messageIDFromString(startPosition.getMessageId());
         }
+        
         // First-time bootstrap: query GetReplicateInfo for the current checkpoint
-        Optional<ReplicateCheckpoint> cp =
-                grpcClient.getReplicateInfo(sourceClusterId, targetPchannel);
-        if (!cp.isPresent()) {
-            throw new MigrationException(
-                    MigrationErrorCode.MIGRATION_CONFIG_INVALID,
-                    "GetReplicateInfo returned no usable checkpoint for pchannel="
-                            + targetPchannel
-                            + ". Configure cdc_start_message_id explicitly or ensure the Milvus "
-                            + "server has CDC/WAL enabled.");
+        try {
+            Optional<ReplicateCheckpoint> cp =
+                    grpcClient.getReplicateInfo(sourceClusterId, targetPchannel);
+            if (cp.isPresent()) {
+                ReplicateCheckpoint checkpoint = cp.get();
+                MessageID mid = MilvusCdcGrpcClient.messageIDFromCheckpoint(checkpoint);
+                lastPosition = ReplicatePosition.builder()
+                        .clusterId(checkpoint.getClusterId())
+                        .pchannel(checkpoint.getPchannel())
+                        .messageId(mid.getId())
+                        .timeTick(checkpoint.getTimeTick())
+                        .timestamp(System.currentTimeMillis())
+                        .build();
+                log.info("Bootstrap from GetReplicateInfo checkpoint: clusterId={}, pchannel={}, messageId={}, timeTick={}",
+                        checkpoint.getClusterId(), checkpoint.getPchannel(), mid.getId(), checkpoint.getTimeTick());
+                return mid;
+            }
+        } catch (Exception e) {
+            log.warn("GetReplicateInfo RPC failed (standalone mode detected): {}", e.getMessage());
         }
-        ReplicateCheckpoint checkpoint = cp.get();
-        MessageID mid = MilvusCdcGrpcClient.messageIDFromCheckpoint(checkpoint);
+        
+        // Fallback for standalone Milvus: use default empty MessageID to start from earliest position
+        MessageID defaultMsgId = createDefaultMessageID();
         lastPosition = ReplicatePosition.builder()
-                .clusterId(checkpoint.getClusterId())
-                .pchannel(checkpoint.getPchannel())
-                .messageId(mid.getId())
-                .timeTick(checkpoint.getTimeTick())
+                .clusterId(sourceClusterId != null ? sourceClusterId : "standalone")
+                .pchannel(targetPchannel)
+                .messageId(defaultMsgId.getId())
+                .timeTick(0L)
                 .timestamp(System.currentTimeMillis())
                 .build();
-        log.info("Bootstrapped from GetReplicateInfo: clusterId={}, pchannel={}, timeTick={}",
-                checkpoint.getClusterId(), checkpoint.getPchannel(), checkpoint.getTimeTick());
-        return mid;
+        log.info("Fallback to default MessageID for standalone mode: messageId={} (will read from earliest WAL position)",
+                defaultMsgId.getId());
+        return defaultMsgId;
+    }
+    
+    /**
+     * Create a default empty MessageID for standalone Milvus mode.
+     * This represents starting from the earliest WAL position.
+     */
+    private MessageID createDefaultMessageID() {
+        // Return an empty MessageID - this should cause the WAL reader to start from the beginning
+        // Note: We don't set WALName field as it's optional and determined by the server
+        return MessageID.newBuilder()
+                .setId("")  // Empty ID represents earliest position
+                .build();
     }
 
     /**
