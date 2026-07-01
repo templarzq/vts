@@ -109,13 +109,19 @@ public class CdcEventStreamStrategyV2 implements CdcStrategy {
     }
 
     /**
-     * Check if StreamingNode gRPC is available.
-     * Uses GetReplicateCheckpoint RPC as a connectivity test.
-     * If the RPC returns FAILED_PRECONDITION (replication not enabled), the service
-     * is still reachable and Consume RPC may work — return true.
-     * Only return false for UNIMPLEMENTED (wrong port) or UNAVAILABLE (connection refused).
+     * Check if StreamingNode gRPC is available and the configured pchannel is valid.
      *
-     * @return true if StreamingNode service is reachable
+     * <p>Two-step probe:
+     * <ol>
+     *   <li>Call {@code GetReplicateCheckpoint} to verify the StreamingNode service is
+     *       reachable. UNIMPLEMENTED (wrong port) or UNAVAILABLE (connection refused)
+     *       → return false immediately.</li>
+     *   <li>If the service is reachable, try opening a Consume stream with auto-detected
+     *       term (1-20). A valid pchannel will succeed at the current term; an invalid
+     *       pchannel name will fail with FAILED_PRECONDITION for all terms.</li>
+     * </ol>
+     *
+     * @return true if StreamingNode service is reachable AND the pchannel is valid
      */
     @Override
     public boolean isAvailable() {
@@ -124,6 +130,10 @@ public class CdcEventStreamStrategyV2 implements CdcStrategy {
             return false;
         }
 
+        // Step 1: Verify StreamingNode service is reachable via GetReplicateCheckpoint.
+        // FAILED_PRECONDITION is expected in standalone mode (replication not enabled),
+        // but the service is still reachable. UNIMPLEMENTED/UNAVAILABLE means the service
+        // is not reachable at all.
         try {
             PChannelInfo pchannel = PChannelInfo.newBuilder()
                     .setName(pchannelName)
@@ -131,28 +141,78 @@ public class CdcEventStreamStrategyV2 implements CdcStrategy {
                     .setAccessMode(PChannelAccessMode.PCHANNEL_ACCESS_READONLY)
                     .build();
 
-            Optional<ReplicateCheckpoint> checkpoint = streamingNodeClient.getReplicateCheckpoint(pchannel);
-            log.info("StreamingNode gRPC available for pchannel={} (checkpoint available: {})",
-                    pchannelName, checkpoint.isPresent());
-            return true;  // RPC succeeded
+            streamingNodeClient.getReplicateCheckpoint(pchannel);
+            log.info("StreamingNode service reachable for pchannel={} (checkpoint RPC succeeded)",
+                    pchannelName);
         } catch (io.grpc.StatusRuntimeException e) {
             io.grpc.Status.Code code = e.getStatus().getCode();
-            log.warn("StreamingNode gRPC status: {} (code={})", e.getMessage(), code);
-
-            // FAILED_PRECONDITION = service exists but replication not enabled
-            // Consume RPC may still work in standalone mode
             if (code == io.grpc.Status.Code.FAILED_PRECONDITION) {
                 log.info("StreamingNode service reachable (FAILED_PRECONDITION on checkpoint, "
-                        + "Consume RPC should still work in standalone mode)");
-                return true;
+                        + "proceeding to pchannel validation via Consume RPC)");
+            } else {
+                log.warn("StreamingNode gRPC not reachable: {} (code={})", e.getMessage(), code);
+                return false;
             }
-
-            // UNIMPLEMENTED = wrong port, UNAVAILABLE = connection refused
-            return false;
         } catch (Exception e) {
             log.warn("StreamingNode gRPC not available: {}", e.getMessage());
             return false;
         }
+
+        // Step 2: Validate the pchannel by trying to open a Consume stream.
+        // A valid pchannel will succeed at the current term; an invalid pchannel name
+        // will fail with FAILED_PRECONDITION for all terms.
+        boolean pchannelValid = probeConsumeStream(pchannelName);
+        if (pchannelValid) {
+            log.info("StreamingNode gRPC available for pchannel={} (Consume probe succeeded)",
+                    pchannelName);
+        } else {
+            log.warn("StreamingNode gRPC service reachable but pchannel={} is invalid "
+                    + "(Consume probe failed for all terms)", pchannelName);
+        }
+        return pchannelValid;
+    }
+
+    /**
+     * Probe the pchannel by trying to open a Consume stream with auto-detected term.
+     * Tries terms 1-20; returns true if any term succeeds, false otherwise.
+     * The probe stream is closed immediately on success (does not set consumeStream).
+     */
+    private boolean probeConsumeStream(String pchannelCandidate) {
+        String vchannelCandidate = pchannelCandidate + "_" + collectionId + "v0";
+        DeliverPolicy policy = DeliverPolicy.newBuilder()
+                .setAll(Empty.newBuilder().build())
+                .build();
+
+        for (long term = 1; term <= 20; term++) {
+            try {
+                PChannelInfo pchannel = PChannelInfo.newBuilder()
+                        .setName(pchannelCandidate)
+                        .setTerm(term)
+                        .setAccessMode(PChannelAccessMode.PCHANNEL_ACCESS_READONLY)
+                        .build();
+
+                ConsumeStream stream = streamingNodeClient.createConsumeStream(
+                        pchannel, vchannelCandidate, policy);
+
+                Thread.sleep(100);
+
+                if (stream.isOpen()) {
+                    stream.close();
+                    log.info("Consume probe succeeded for pchannel={}, term={}",
+                            pchannelCandidate, term);
+                    return true;
+                } else {
+                    try {
+                        stream.close();
+                    } catch (Exception ignored) {
+                    }
+                }
+            } catch (Exception e) {
+                log.debug("Consume probe failed for pchannel={}, term={}: {}",
+                        pchannelCandidate, term, e.getMessage());
+            }
+        }
+        return false;
     }
 
     /**

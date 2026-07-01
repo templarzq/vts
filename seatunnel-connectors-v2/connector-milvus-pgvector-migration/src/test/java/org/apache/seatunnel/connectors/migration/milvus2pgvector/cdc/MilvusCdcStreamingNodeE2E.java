@@ -358,64 +358,114 @@ public class MilvusCdcStreamingNodeE2E extends MilvusCdcE2ETestBase {
 
     @Test
     @Order(4)
-    @DisplayName("streaming_node delete capture — RowKind.DELETE events from WAL (pending full parser)")
+    @DisplayName("streaming_node delete capture — RowKind.DELETE events from WAL (core)")
     void testDeleteCapture() throws Exception {
         Assumptions.assumeTrue(cdcAvailable, "StreamingNode CDC not available, skipping");
         String scenarioName = "streaming_node.delete_capture";
         String collectionName = "cdc_sn_delete";
+        String pgTable = "cdc_sn_delete";
         log.info("=== {} START ===", scenarioName);
         try {
+            // Setup: initial data
             createCollection(collectionName, VECTOR_DIM);
             insertData(collectionName, 0, SNAPSHOT_COUNT, VECTOR_DIM, 300L);
+            createPgTable(pgTable, VECTOR_DIM);
 
-            // Verify StreamingNode gRPC connectivity for this collection
-            try (CdcEventStreamStrategyV2 strategy = buildStreamingNodeStrategy(collectionName)) {
-                // WAL message payload parsing (for INSERT/DELETE) requires internal Milvus
-                // proto definitions which differ from the client-facing SDK protos.
-                // Once the internal proto format is integrated, this test will verify
-                // that DELETE events are captured from the WAL stream.
-                log.info("[{}] StreamingNode connection verified (DELETE parsing requires "
-                        + "internal Milvus proto integration)", scenarioName);
+            // Snapshot phase
+            PollingIncrementalCdcStrategy snapshotStrategy =
+                    buildPollingStrategy(collectionName, 500);
+            List<SeaTunnelRowWithPosition> snapshotRows =
+                    runCdcSnapshot(snapshotStrategy, collectionName, SNAPSHOT_COUNT);
+            applyRowsToPg(pgTable, snapshotRows, VECTOR_DIM);
 
-                try (CdcMetricsCollector.ScenarioTimer timer =
-                        metrics.startScenario(scenarioName, 0)) {
-                    timer.actualRows(0).failedRows(0);
-                }
+            int pgCountBefore = queryPgCount(pgTable);
+            log.info("[{}] pgvector count before delete: {}", scenarioName, pgCountBefore);
+
+            // Delete DELETE_COUNT rows from Milvus
+            deleteData(collectionName, 0, DELETE_COUNT);
+            log.info("[{}] Deleted {} rows from Milvus", scenarioName, DELETE_COUNT);
+
+            // Poll for delete events via V2 strategy
+            try (CdcEventStreamStrategyV2 strategy = buildStreamingNodeStrategy(collectionName);
+                    CdcMetricsCollector.ScenarioTimer timer =
+                            metrics.startScenario(scenarioName, DELETE_COUNT)) {
+                List<SeaTunnelRowWithPosition> events =
+                        pollForEvents(strategy, collectionName, 30000, null);
+
+                List<SeaTunnelRow> deleteRows = extractRowsByKind(events, RowKind.DELETE);
+                log.info("[{}] Captured {} DELETE events (expected {})",
+                        scenarioName, deleteRows.size(), DELETE_COUNT);
+
+                // Apply deletes to pgvector
+                applyDeleteRowsToPg(pgTable, deleteRows);
+                timer.actualRows(deleteRows.size());
+
+                // Verify: pgvector count should decrease
+                int pgCountAfter = queryPgCount(pgTable);
+                log.info("[{}] pgvector count after delete: {}", scenarioName, pgCountAfter);
+                assertTrue(pgCountAfter < pgCountBefore,
+                        "pgvector count should decrease after deletes: before="
+                                + pgCountBefore + ", after=" + pgCountAfter);
+
+                log.info("[{}] Delete capture verified: {} DELETE events applied",
+                        scenarioName, deleteRows.size());
             }
             log.info("=== {} END ===", scenarioName);
         } finally {
             dropCollection(collectionName);
+            dropPgTable(pgTable);
         }
     }
 
     @Test
     @Order(5)
-    @DisplayName("streaming_node checkpoint recovery — DeliverPolicy.startAfter (pending full parser)")
+    @DisplayName("streaming_node checkpoint recovery — DeliverPolicy.startAfter")
     void testCheckpointRecovery() throws Exception {
         Assumptions.assumeTrue(cdcAvailable, "StreamingNode CDC not available, skipping");
         String scenarioName = "streaming_node.checkpoint_recovery";
         String collectionName = "cdc_sn_checkpoint";
+        String pgTable = "cdc_sn_checkpoint";
         log.info("=== {} START ===", scenarioName);
         try {
             createCollection(collectionName, VECTOR_DIM);
             insertData(collectionName, 0, 50, VECTOR_DIM, 500L);
+            createPgTable(pgTable, VECTOR_DIM);
 
-            // Verify checkpoint capability
+            // First poll: get initial events and a checkpoint
+            ReplicatePosition checkpoint;
             try (CdcEventStreamStrategyV2 strategy = buildStreamingNodeStrategy(collectionName)) {
-                // WAL message payload parsing requires internal Milvus proto integration.
-                // Once available, DeliverPolicy.startAfter checkpoint recovery will be tested.
-                boolean available = strategy.isAvailable();
-                log.info("[{}] StreamingNode available={}, checkpoint recovery pending "
-                        + "internal Milvus proto integration", scenarioName, available);
+                List<SeaTunnelRowWithPosition> firstBatch =
+                        pollForEvents(strategy, collectionName, 10000, null);
+                assertFalse(firstBatch.isEmpty(), "First batch should have events");
+                checkpoint = firstBatch.get(firstBatch.size() - 1).getPosition();
+                log.info("[{}] First batch: {} events, checkpoint messageId={}",
+                        scenarioName, firstBatch.size(),
+                        checkpoint != null ? checkpoint.getMessageId() : "null");
+            }
 
-                try (CdcMetricsCollector.ScenarioTimer timer =
-                        metrics.startScenario(scenarioName, 0)) {
-                    timer.actualRows(0).failedRows(0);
-                }
+            // Insert more data after checkpoint
+            insertData(collectionName, 50, 30, VECTOR_DIM, 600L);
+
+            // Second poll: resume from checkpoint
+            try (CdcEventStreamStrategyV2 strategy = buildStreamingNodeStrategy(collectionName);
+                    CdcMetricsCollector.ScenarioTimer timer =
+                            metrics.startScenario(scenarioName, 30)) {
+                List<SeaTunnelRowWithPosition> secondBatch =
+                        pollForEvents(strategy, collectionName, 15000, checkpoint);
+                log.info("[{}] Second batch (after checkpoint): {} events",
+                        scenarioName, secondBatch.size());
+
+                assertFalse(secondBatch.isEmpty(),
+                        "Second batch should have events after checkpoint");
+                timer.actualRows(secondBatch.size());
+
+                log.info("[{}] Checkpoint recovery verified: resumed from messageId={}",
+                        scenarioName, checkpoint.getMessageId());
             }
             log.info("=== {} END ===", scenarioName);
         } finally {
             dropCollection(collectionName);
+            dropPgTable(pgTable);
         }
     }
 

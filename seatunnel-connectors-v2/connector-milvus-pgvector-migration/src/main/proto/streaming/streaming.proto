@@ -1,0 +1,227 @@
+syntax = "proto3";
+
+package milvus.proto.streaming;
+
+option java_multiple_files = true;
+option java_package = "org.apache.seatunnel.connectors.streaming.proto";
+option java_outer_classname = "StreamingProto";
+
+import "google/protobuf/empty.proto";
+
+//
+// Common Types (compatible with milvus.proto common package)
+//
+
+// PChannelAccessMode is the access mode of a pchannel.
+enum PChannelAccessMode {
+    PCHANNEL_ACCESS_READWRITE = 0;  // read and write by default.
+    PCHANNEL_ACCESS_READONLY = 1;  // read only.
+}
+
+// PChannelInfo is the information of a pchannel.
+message PChannelInfo {
+    string name = 1;  // channel name
+    int64 term  = 2;  // A monotonic increasing term
+    PChannelAccessMode access_mode = 3;  // access mode of the channel.
+}
+
+// MessageID is the identifier of a message within a PChannel.
+// Compatible with milvus common.MessageID.
+message MessageID {
+    bytes id = 1;
+}
+
+// ImmutableMessage is the envelope returned by Consume stream.
+// Compatible with milvus common.ImmutableMessage.
+message ImmutableMessage {
+    MessageID id = 1;
+    bytes payload = 2;
+    map<string, string> properties = 3;
+}
+
+// ReplicateCheckpoint is returned by GetReplicateCheckpoint.
+// Compatible with milvus common.ReplicateCheckpoint.
+message ReplicateCheckpoint {
+    string cluster_id = 1;
+    string pchannel = 2;
+    bytes message_id = 3;
+    uint64 time_tick = 4;
+}
+
+// WALMessage wraps the actual operation in the WAL.
+// Compatible with milvus messages.proto Message.
+// The WAL stores: ImmutableMessage.payload = serialized WALMessage
+// WALMessage.payload = serialized operation (InsertRequest/DeleteRequest/...)
+message WALMessage {
+    bytes payload = 1;
+    map<string, string> properties = 2;
+}
+
+//
+// StreamingNodeInfo
+//
+
+message StreamingNodeInfo {
+    int64 server_id = 1;
+    string address  = 2;
+}
+
+//
+// DeliverPolicy and Filters
+//
+
+// DeliverPolicy is the policy to deliver message.
+message DeliverPolicy {
+    oneof policy {
+        google.protobuf.Empty all    = 1;  // deliver all messages (full snapshot)
+        google.protobuf.Empty latest = 2;  // deliver the latest message
+        MessageID start_from = 3;          // deliver message from this message id [startFrom, ...]
+        MessageID start_after = 4;         // deliver message after this message id (startAfter, ...] (checkpoint recovery)
+    }
+}
+
+//
+// Consume RPC Messages
+//
+
+// ConsumeRequest is the request of the Consume RPC.
+message ConsumeRequest {
+    oneof request {
+        CreateVChannelConsumerRequest create_vchannel_consumer = 1;
+        CreateVChannelConsumersRequest create_vchannel_consumers = 2;
+        CloseVChannelConsumerRequest close_vchannel = 3;
+        CloseConsumerRequest close = 4;
+    }
+}
+
+// CreateConsumerRequest is passed in the gRPC metadata header of the Consume stream.
+message CreateConsumerRequest {
+    PChannelInfo pchannel = 1;
+}
+
+// CreateVChannelConsumerRequest creates a consumer for a vchannel.
+// Field numbers match milvus streaming.proto exactly.
+message CreateVChannelConsumerRequest {
+    string vchannel = 1;
+    DeliverPolicy deliver_policy = 2;
+    // Field 3: Milvus uses repeated DeliverFilter deliver_filters = 3.
+    // We don't set it, so it will be omitted in proto3 (empty repeated field).
+    // Field 4: Milvus uses bool ignore_pause_consumption = 4.
+    // We don't set it, so it defaults to false and is omitted in proto3.
+}
+
+// CreateVChannelConsumersRequest creates consumers for multiple vchannels.
+message CreateVChannelConsumersRequest {
+    repeated CreateVChannelConsumerRequest create_vchannels = 1;
+}
+
+// CloseVChannelConsumerRequest closes a vchannel consumer.
+message CloseVChannelConsumerRequest {
+    int64 consumer_id = 1;
+}
+
+// CloseConsumerRequest closes all consumers.
+message CloseConsumerRequest {
+}
+
+// ConsumeResponse is the response of the Consume RPC.
+// Field numbers match milvus streaming.proto exactly.
+message ConsumeResponse {
+    oneof response {
+        CreateConsumerResponse create = 1;
+        ConsumeMessageReponse consume = 2;
+        CreateVChannelConsumerResponse create_vchannel = 3;
+        CreateVChannelConsumersResponse create_vchannels = 4;
+        CloseVChannelConsumerResponse close_vchannel = 5;
+        CloseConsumerResponse close = 6;
+    }
+}
+
+// CreateConsumerResponse is sent when a consumer is successfully created.
+message CreateConsumerResponse {
+    string wal_name = 1;  // deprecated, wal name at server side.
+    int64 consumer_server_id = 2;  // unique consumer id on streamingnode.
+}
+
+// CreateVChannelConsumerResponse is the response of the CreateVChannelConsumer RPC.
+message CreateVChannelConsumerResponse {
+    oneof response {
+        int64 consumer_id = 1;
+        StreamingError error = 2;
+    }
+}
+
+// CreateVChannelConsumersResponse is the response of the CreateVChannelConsumers RPC.
+message CreateVChannelConsumersResponse {
+    repeated CreateVChannelConsumerResponse create_vchannels = 1;
+}
+
+// CloseVChannelConsumerResponse is the response of the CloseVChannelConsumer RPC.
+message CloseVChannelConsumerResponse {
+    int64 consumer_id = 1;
+}
+
+// CloseConsumerResponse is the response of the CloseConsumer RPC.
+message CloseConsumerResponse {
+}
+
+// ConsumeMessageReponse contains a WAL message.
+message ConsumeMessageReponse {
+    int64 consumer_id = 1;
+    ImmutableMessage message = 2;
+}
+
+// StreamingCode is the error code for log internal component.
+enum StreamingCode {
+    STREAMING_CODE_OK                     = 0;
+    STREAMING_CODE_CHANNEL_NOT_EXIST      = 1;
+    STREAMING_CODE_CHANNEL_FENCED         = 2;
+    STREAMING_CODE_ON_SHUTDOWN            = 3;
+    STREAMING_CODE_INVALID_REQUEST_SEQ    = 4;
+    STREAMING_CODE_UNMATCHED_CHANNEL_TERM = 5;
+    STREAMING_CODE_IGNORED_OPERATION      = 6;
+    STREAMING_CODE_INNER                  = 7;
+    STREAMING_CODE_INVAILD_ARGUMENT       = 8;
+    STREAMING_CODE_TRANSACTION_EXPIRED    = 9;
+    STREAMING_CODE_INVALID_TRANSACTION_STATE = 10;
+    STREAMING_CODE_UNRECOVERABLE          = 11;
+    STREAMING_CODE_RESOURCE_ACQUIRED      = 12;
+    STREAMING_CODE_REPLICATE_VIOLATION    = 13;
+    STREAMING_CODE_WALNAME_MISMATCH       = 14;
+    STREAMING_CODE_SCHEMA_VERSION_MISMATCH = 15;
+    STREAMING_CODE_RATE_LIMIT_REJECTED    = 16;
+    STREAMING_CODE_UNKNOWN               = 999;
+}
+
+// StreamingError is the error type for log internal component.
+message StreamingError {
+    StreamingCode code = 1;
+    string cause       = 2;
+}
+
+//
+// GetReplicateCheckpoint RPC Messages
+//
+
+// GetReplicateCheckpointRequest is the request of GetReplicateCheckpoint service.
+message GetReplicateCheckpointRequest {
+    PChannelInfo pchannel = 1;
+}
+
+// GetReplicateCheckpointResponse is the response of GetReplicateCheckpoint service.
+message GetReplicateCheckpointResponse {
+    ReplicateCheckpoint checkpoint = 1;
+}
+
+//
+// StreamingNodeHandlerService
+//
+
+// StreamingNodeHandlerService is the service to handle WAL messages.
+service StreamingNodeHandlerService {
+    // GetReplicateCheckpoint returns the WAL checkpoint for scanner creation.
+    rpc GetReplicateCheckpoint(GetReplicateCheckpointRequest) returns (GetReplicateCheckpointResponse) {}
+
+    // Consume is a bi-directional streaming RPC to receive messages from a channel.
+    rpc Consume(stream ConsumeRequest) returns (stream ConsumeResponse) {};
+}

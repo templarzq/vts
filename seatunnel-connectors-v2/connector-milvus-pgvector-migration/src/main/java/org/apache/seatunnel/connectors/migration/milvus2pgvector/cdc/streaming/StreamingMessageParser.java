@@ -21,16 +21,17 @@ import org.apache.seatunnel.api.table.type.RowKind;
 import org.apache.seatunnel.api.table.type.SeaTunnelRow;
 import org.apache.seatunnel.connectors.streaming.proto.ImmutableMessage;
 import org.apache.seatunnel.connectors.streaming.proto.MessageID;
-import org.apache.seatunnel.connectors.streaming.proto.WALMessage;
 
-import com.google.protobuf.InvalidProtocolBufferException;
-import io.milvus.grpc.DeleteRequest;
-import io.milvus.grpc.InsertRequest;
+import io.milvus.grpc.IDs;
+import io.milvus.grpc.LongArray;
+import io.milvus.grpc.StringArray;
 import io.milvus.v2.service.collection.request.CreateCollectionReq;
 import io.milvus.v2.service.collection.response.DescribeCollectionResp;
 import lombok.extern.slf4j.Slf4j;
+import milvus.proto.msg.Msg;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -42,15 +43,15 @@ import java.util.Map;
  * <pre>
  * ImmutableMessage {
  *     id: MessageID
- *     payload: serialized WALMessage {
- *         payload: serialized InsertRequest / DeleteRequest / ...
- *         properties: message-level metadata
- *     }
+ *     payload: serialized milvus.proto.msg.Msg$InsertRequest or Msg$DeleteRequest
  *     properties: {
  *         _t: message type (1=TimeTick, 2=Insert, 3=Delete, ...)
- *         _tt: time tick
+ *         _tt: time tick (base36 encoded)
  *         _v: version
- *         ...
+ *         _vc: vchannel
+ *         _h: header (base64 encoded)
+ *         _wt: write type
+ *         _lc: last confirmed
  *     }
  * }
  * </pre>
@@ -60,7 +61,6 @@ public class StreamingMessageParser {
 
     private final DescribeCollectionResp collectionDesc;
     private final String primaryKeyField;
-    private final long collectionId;
 
     // Message type key and values (from Milvus WAL properties)
     private static final String MSG_TYPE_KEY = "_t";
@@ -81,14 +81,10 @@ public class StreamingMessageParser {
     public StreamingMessageParser(DescribeCollectionResp collectionDesc, String primaryKeyField) {
         this.collectionDesc = collectionDesc;
         this.primaryKeyField = primaryKeyField;
-        this.collectionId = collectionDesc.getCollectionID();
     }
 
     /**
      * Parse message type from ImmutableMessage properties.
-     *
-     * @param message ImmutableMessage from WAL stream
-     * @return Message type integer: 1=TimeTick, 2=Insert, 3=Delete, etc.
      */
     public int parseMessageTypeInt(ImmutableMessage message) {
         Map<String, String> properties = message.getPropertiesMap();
@@ -116,9 +112,6 @@ public class StreamingMessageParser {
 
     /**
      * Parse ImmutableMessage into SeaTunnelRow(s).
-     *
-     * @param message ImmutableMessage from WAL stream
-     * @return List of SeaTunnelRow (may be empty for control messages like TimeTick)
      */
     public List<SeaTunnelRow> parseMessage(ImmutableMessage message) {
         int messageType = parseMessageTypeInt(message);
@@ -132,22 +125,17 @@ public class StreamingMessageParser {
 
             case MSG_TYPE_TIMETICK:
             case MSG_TYPE_FLUSH:
-                // Control messages, skip
                 return new ArrayList<>();
 
             default:
-                log.debug("Unknown message type: {}, properties: {}",
-                        messageType, message.getPropertiesMap());
+                log.debug("Unknown message type: {}", messageType);
                 return new ArrayList<>();
         }
     }
 
     /**
      * Parse Insert message into SeaTunnelRow(s).
-     * The ImmutableMessage payload wraps a WALMessage, which wraps an InsertRequest.
-     *
-     * @param message ImmutableMessage
-     * @return List of SeaTunnelRow with RowKind.INSERT
+     * Uses the internal Milvus proto milvus.proto.msg.Msg$InsertRequest.
      */
     private List<SeaTunnelRow> parseInsertMessage(ImmutableMessage message) {
         List<SeaTunnelRow> rows = new ArrayList<>();
@@ -155,67 +143,61 @@ public class StreamingMessageParser {
         try {
             byte[] rawPayload = message.getPayload().toByteArray();
 
-            // Debug: dump first bytes
-            if (log.isWarnEnabled()) {
-                StringBuilder hex = new StringBuilder();
-                int dumpLen = Math.min(rawPayload.length, 128);
-                for (int i = 0; i < dumpLen; i++) {
-                    hex.append(String.format("%02x ", rawPayload[i]));
-                }
-                log.warn("Insert msg payload hex ({} bytes): {}", rawPayload.length, hex.toString());
-                log.warn("Insert msg properties: {}", message.getPropertiesMap());
-            }
+            // Parse as internal Milvus Msg$InsertRequest
+            Msg.InsertRequest insertRequest = Msg.InsertRequest.parseFrom(rawPayload);
 
-            // Try direct InsertRequest parsing (ImmutableMessage.payload = raw InsertRequest)
-            InsertRequest insertRequest;
-            try {
-                insertRequest = InsertRequest.parseFrom(rawPayload);
-            } catch (Exception e) {
-                // Try WALMessage wrapper as fallback
-                try {
-                    WALMessage walMessage = WALMessage.parseFrom(rawPayload);
-                    byte[] innerPayload = walMessage.getPayload().toByteArray();
-                    insertRequest = InsertRequest.parseFrom(innerPayload);
-                } catch (Exception e2) {
-                    log.warn("Failed to parse Insert payload ({} bytes): inner={}", rawPayload.length, e2.getMessage());
-                    return rows;
-                }
-            }
-
-            // Step 3: Extract field data from InsertRequest
             List<io.milvus.grpc.FieldData> fieldsDataList = insertRequest.getFieldsDataList();
             if (fieldsDataList.isEmpty()) {
-                log.debug("Insert message has no fields_data, skipping");
+                log.debug("InsertRequest has no fields_data, collection={}",
+                        insertRequest.getCollectionName());
                 return rows;
             }
 
-            // Get the number of rows from the first field's data
-            long numRows = getFieldDataRowCount(fieldsDataList.get(0));
+            // Get number of rows from the first field's data
+            long numRows = insertRequest.getNumRows();
             if (numRows <= 0) {
-                log.debug("Insert message has 0 rows");
+                numRows = getFieldDataRowCount(fieldsDataList.get(0));
+            }
+            if (numRows <= 0) {
+                log.debug("InsertRequest has 0 rows");
                 return rows;
             }
 
-            // Get field names from collection schema
+            // Build field_name -> FieldData map for correct matching
+            java.util.Map<String, io.milvus.grpc.FieldData> fieldDataMap = new java.util.LinkedHashMap<>();
+            for (io.milvus.grpc.FieldData fd : fieldsDataList) {
+                String fieldName = fd.getFieldName();
+                if (fieldName != null && !fieldName.isEmpty()) {
+                    fieldDataMap.put(fieldName, fd);
+                }
+            }
+
+            // Get field schemas from collection description
             List<CreateCollectionReq.FieldSchema> fieldSchemas =
                     collectionDesc.getCollectionSchema().getFieldSchemaList();
 
-            // Create rows
-            for (int rowIdx = 0; rowIdx < numRows; rowIdx++) {
+            // Create SeaTunnelRow for each row
+            for (int rowIdx = 0; rowIdx < numRows && rowIdx < Integer.MAX_VALUE; rowIdx++) {
                 SeaTunnelRow row = new SeaTunnelRow(fieldSchemas.size());
                 row.setRowKind(RowKind.INSERT);
 
-                for (int fieldIdx = 0; fieldIdx < fieldSchemas.size() && fieldIdx < fieldsDataList.size(); fieldIdx++) {
-                    Object value = extractFieldValue(fieldsDataList.get(fieldIdx), rowIdx,
-                            fieldSchemas.get(fieldIdx));
-                    row.setField(fieldIdx, value);
+                for (int fieldIdx = 0; fieldIdx < fieldSchemas.size(); fieldIdx++) {
+                    CreateCollectionReq.FieldSchema schema = fieldSchemas.get(fieldIdx);
+                    io.milvus.grpc.FieldData fd = fieldDataMap.get(schema.getName());
+                    if (fd != null) {
+                        Object value = extractFieldValue(fd, rowIdx, schema);
+                        row.setField(fieldIdx, value);
+                    }
                 }
                 rows.add(row);
             }
 
-            log.debug("Parsed Insert message: {} rows", rows.size());
+            log.info("Parsed Insert: {} rows, collection={}", rows.size(),
+                    insertRequest.getCollectionName());
+
         } catch (Exception e) {
-            log.warn("Failed to parse Insert message: {}", e.getMessage());
+            log.warn("Failed to parse InsertRequest ({} bytes): {}",
+                    message.getPayload().size(), e.getMessage());
         }
 
         return rows;
@@ -223,10 +205,7 @@ public class StreamingMessageParser {
 
     /**
      * Parse Delete message into SeaTunnelRow(s).
-     * Delete messages contain primary keys to be removed.
-     *
-     * @param message ImmutableMessage
-     * @return List of SeaTunnelRow with RowKind.DELETE
+     * Uses the internal Milvus proto milvus.proto.msg.Msg$DeleteRequest.
      */
     private List<SeaTunnelRow> parseDeleteMessage(ImmutableMessage message) {
         List<SeaTunnelRow> rows = new ArrayList<>();
@@ -234,68 +213,63 @@ public class StreamingMessageParser {
         try {
             byte[] rawPayload = message.getPayload().toByteArray();
 
-            // Try direct DeleteRequest parsing first
-            DeleteRequest deleteRequest;
-            try {
-                deleteRequest = DeleteRequest.parseFrom(rawPayload);
-            } catch (Exception e) {
-                // Try WALMessage wrapper as fallback
-                try {
-                    WALMessage walMessage = WALMessage.parseFrom(rawPayload);
-                    deleteRequest = DeleteRequest.parseFrom(walMessage.getPayload().toByteArray());
-                } catch (Exception e2) {
-                    log.warn("Failed to parse Delete payload ({} bytes): {}", rawPayload.length, e2.getMessage());
+            // Parse as internal Milvus Msg$DeleteRequest
+            Msg.DeleteRequest deleteRequest = Msg.DeleteRequest.parseFrom(rawPayload);
+
+            int numFields = collectionDesc.getCollectionSchema().getFieldSchemaList().size();
+
+            // Method 1: Try getPrimaryKeys() for IDs type
+            IDs primaryKeys = deleteRequest.getPrimaryKeys();
+            if (primaryKeys != null) {
+                // Int64 primary keys
+                LongArray intId = primaryKeys.getIntId();
+                if (intId != null && intId.getDataCount() > 0) {
+                    for (Long pk : intId.getDataList()) {
+                        SeaTunnelRow row = new SeaTunnelRow(numFields);
+                        row.setRowKind(RowKind.DELETE);
+                        row.setField(0, pk);
+                        rows.add(row);
+                    }
+                    log.info("Parsed Delete: {} PKs (Int64 IDs), collection={}",
+                            rows.size(), deleteRequest.getCollectionName());
+                    return rows;
+                }
+
+                // String primary keys
+                StringArray strId = primaryKeys.getStrId();
+                if (strId != null && strId.getDataCount() > 0) {
+                    for (String pk : strId.getDataList()) {
+                        SeaTunnelRow row = new SeaTunnelRow(numFields);
+                        row.setRowKind(RowKind.DELETE);
+                        row.setField(0, pk);
+                        rows.add(row);
+                    }
+                    log.info("Parsed Delete: {} PKs (VarChar IDs), collection={}",
+                            rows.size(), deleteRequest.getCollectionName());
                     return rows;
                 }
             }
 
-            // Step 3: Extract delete info
-            // The Milvus DeleteRequest uses expressions (e.g., "id >= 0 && id < 30")
-            // Try to extract PK range from the expression
-            String expr = deleteRequest.getExpr();
-            int numFields = collectionDesc.getCollectionSchema().getFieldSchemaList().size();
-
-            if (expr != null && !expr.isEmpty()) {
-                log.info("Delete expression: {} for collection={}", expr, deleteRequest.getCollectionName());
-
-                // Try to parse simple range expression: "id >= M && id < N"
-                try {
-                    java.util.regex.Pattern pattern = java.util.regex.Pattern.compile(
-                            "id\\s*>=\\s*(-?\\d+)\\s*&&\\s*id\\s*<\\s*(-?\\d+)");
-                    java.util.regex.Matcher matcher = pattern.matcher(expr);
-                    if (matcher.find()) {
-                        long startId = Long.parseLong(matcher.group(1));
-                        long endId = Long.parseLong(matcher.group(2));
-                        log.info("Parsed delete range: id {}..{}", startId, endId - 1);
-                        for (long pk = startId; pk < endId; pk++) {
-                            SeaTunnelRow row = new SeaTunnelRow(numFields);
-                            row.setRowKind(RowKind.DELETE);
-                            row.setField(0, pk);
-                            rows.add(row);
-                        }
-                        return rows;
-                    }
-                } catch (Exception ex) {
-                    log.warn("Failed to parse delete expression '{}': {}", expr, ex.getMessage());
-                }
-            }
-
-            // Fallback: check hash_keys for Int64 PKs
-            java.util.List<Integer> hashKeys = deleteRequest.getHashKeysList();
-            if (!hashKeys.isEmpty()) {
-                for (Integer pk : hashKeys) {
+            // Method 2: Fallback to getInt64PrimaryKeysList()
+            List<Long> int64Pks = deleteRequest.getInt64PrimaryKeysList();
+            if (!int64Pks.isEmpty()) {
+                for (Long pk : int64Pks) {
                     SeaTunnelRow row = new SeaTunnelRow(numFields);
                     row.setRowKind(RowKind.DELETE);
-                    row.setField(0, (long) pk);
+                    row.setField(0, pk);
                     rows.add(row);
                 }
-                log.info("Extracted {} PKs from hash_keys (Int64)", rows.size());
+                log.info("Parsed Delete: {} PKs (Int64 list), collection={}",
+                        rows.size(), deleteRequest.getCollectionName());
                 return rows;
             }
 
-            log.debug("Delete message has no extractable primary keys, expr='{}'", expr);
+            log.debug("DeleteRequest has no extractable primary keys, collection={}",
+                    deleteRequest.getCollectionName());
+
         } catch (Exception e) {
-            log.warn("Failed to parse Delete message: {}", e.getMessage());
+            log.warn("Failed to parse DeleteRequest ({} bytes): {}",
+                    message.getPayload().size(), e.getMessage());
         }
 
         return rows;
@@ -317,7 +291,9 @@ public class StreamingMessageParser {
         }
         if (fieldData.hasVectors()) {
             io.milvus.grpc.VectorField vectors = fieldData.getVectors();
-            return vectors.getFloatVector().getDataCount() / vectors.getDim();
+            if (vectors.hasFloatVector()) {
+                return vectors.getFloatVector().getDataCount() / vectors.getDim();
+            }
         }
         return 0;
     }
@@ -331,31 +307,24 @@ public class StreamingMessageParser {
             io.milvus.grpc.ScalarField scalars = fieldData.getScalars();
             int idx = (int) rowIdx;
 
-            // Int64 (Long)
             if (scalars.hasLongData()) {
                 return scalars.getLongData().getData(idx);
             }
-            // Int32
             if (scalars.hasIntData()) {
                 return (long) scalars.getIntData().getData(idx);
             }
-            // Float
             if (scalars.hasFloatData()) {
                 return scalars.getFloatData().getData(idx);
             }
-            // Double
             if (scalars.hasDoubleData()) {
                 return scalars.getDoubleData().getData(idx);
             }
-            // Boolean
             if (scalars.hasBoolData()) {
                 return scalars.getBoolData().getData(idx);
             }
-            // String
             if (scalars.hasStringData()) {
                 return scalars.getStringData().getData(idx);
             }
-            // JSON
             if (scalars.hasJsonData()) {
                 return scalars.getJsonData().getData(idx).toStringUtf8();
             }
@@ -377,9 +346,6 @@ public class StreamingMessageParser {
 
     /**
      * Extract MessageID from ImmutableMessage for checkpoint.
-     *
-     * @param message ImmutableMessage
-     * @return MessageID proto object
      */
     public MessageID extractMessageID(ImmutableMessage message) {
         return message.getId();
@@ -387,14 +353,11 @@ public class StreamingMessageParser {
 
     /**
      * Extract timetick from ImmutableMessage properties.
-     *
-     * @param message ImmutableMessage
-     * @return timetick value (as long)
+     * Timetick is base36 encoded in the WAL.
      */
     public long extractTimetick(ImmutableMessage message) {
         Map<String, String> properties = message.getPropertiesMap();
         String timetickStr = properties.getOrDefault(TIMETICK_KEY, "0");
-        // Timetick is base36 encoded
         try {
             return Long.parseLong(timetickStr, 36);
         } catch (NumberFormatException e) {
@@ -405,9 +368,6 @@ public class StreamingMessageParser {
 
     /**
      * Check if message is a data message (Insert/Delete).
-     *
-     * @param message ImmutableMessage
-     * @return true if it's a data message
      */
     public boolean isDataMessage(ImmutableMessage message) {
         int messageType = parseMessageTypeInt(message);
