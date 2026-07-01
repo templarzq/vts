@@ -433,8 +433,10 @@ public abstract class MilvusCdcE2ETestBase {
                 SeaTunnelRow row = rowPos.getRow();
                 Object[] fields = row.getFields();
                 if (fields[0] == null) continue;
+                String vecStr = toVectorString(fields[1], vectorDim);
+                if (vecStr == null) continue;
                 ps.setLong(1, toLong(fields[0]));
-                ps.setString(2, toVectorString(fields[1], vectorDim));
+                ps.setString(2, vecStr);
                 ps.setString(3, fields[2] != null ? fields[2].toString() : null);
                 ps.setLong(4, fields[3] != null ? toLong(fields[3]) : 0);
                 ps.addBatch();
@@ -879,9 +881,9 @@ public abstract class MilvusCdcE2ETestBase {
     }
 
     protected String toVectorString(Object vecObj, int dim) {
-        if (vecObj == null) return "[]";
+        if (vecObj == null) return null;
         float[] floats = extractMilvusVector(vecObj, dim);
-        if (floats == null) return "[]";
+        if (floats == null) return null;
         StringBuilder sb = new StringBuilder("[");
         for (int i = 0; i < floats.length; i++) {
             if (i > 0) sb.append(",");

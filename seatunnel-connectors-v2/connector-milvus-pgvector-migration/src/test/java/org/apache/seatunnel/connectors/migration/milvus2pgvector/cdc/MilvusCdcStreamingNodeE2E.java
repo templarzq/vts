@@ -77,9 +77,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 public class MilvusCdcStreamingNodeE2E extends MilvusCdcE2ETestBase {
 
     private static final int VECTOR_DIM = 64;
-    private static final int SNAPSHOT_COUNT = 100;
+    private static final int SNAPSHOT_COUNT = 500;
+    private static final int SNAPSHOT_COUNT_LARGE = 1000;
     private static final int INSERT_COUNT = 50;
-    private static final int DELETE_COUNT = 30;
+    private static final int DELETE_COUNT = 50;
     private static final String PCHANNEL = "by-dev-rootcoord-dml_0";
     private static final String STREAMING_NODE_ADDR = "localhost:22222";
 
@@ -100,6 +101,10 @@ public class MilvusCdcStreamingNodeE2E extends MilvusCdcE2ETestBase {
      * Uses StreamingNode gRPC with DeliverPolicy for WAL access.
      */
     private CdcEventStreamStrategyV2 buildStreamingNodeStrategy(String collectionName) {
+        return buildStreamingNodeStrategy(collectionName, 2000L);
+    }
+
+    private CdcEventStreamStrategyV2 buildStreamingNodeStrategy(String collectionName, long batchSize) {
         DescribeCollectionResp desc = milvusClient.describeCollection(
                 DescribeCollectionReq.builder()
                         .collectionName(collectionName)
@@ -118,7 +123,7 @@ public class MilvusCdcStreamingNodeE2E extends MilvusCdcE2ETestBase {
                 .cdcUseStreamingNode(true)
                 .cdcPchannel(actualPchannel != null ? actualPchannel : PCHANNEL)
                 .streamingNodeAddress(STREAMING_NODE_ADDR)
-                .incrementalBatchSize(500L)
+                .incrementalBatchSize(batchSize)
                 .pollIntervalMs(500L)
                 .channelTimeoutMs(60000L)
                 .primaryKeyField("id")
@@ -184,7 +189,7 @@ public class MilvusCdcStreamingNodeE2E extends MilvusCdcE2ETestBase {
             CdcEventStreamStrategyV2 strategy, String collectionName,
             long timeoutMs, ReplicatePosition startPosition)
             throws Exception {
-        return pollForEvents(strategy, collectionName, timeoutMs, startPosition, 3);
+        return pollForEvents(strategy, collectionName, timeoutMs, startPosition, 1);
     }
 
     /**
@@ -216,7 +221,7 @@ public class MilvusCdcStreamingNodeE2E extends MilvusCdcE2ETestBase {
                             + "(collected {} events)", consecutiveEmpty, allEvents.size());
                     break;
                 }
-                Thread.sleep(200);
+                Thread.sleep(10);
             } else {
                 consecutiveEmpty = 0;
             }
@@ -296,7 +301,7 @@ public class MilvusCdcStreamingNodeE2E extends MilvusCdcE2ETestBase {
                             metrics.startScenario(scenarioName, SNAPSHOT_COUNT)) {
 
                 List<SeaTunnelRowWithPosition> snapshotRows =
-                        pollForEvents(strategy, collectionName, 30000, null);
+                        pollForEvents(strategy, collectionName, 15000, null);
                 List<SeaTunnelRow> insertRows = extractRowsByKind(snapshotRows, RowKind.INSERT);
                 log.info("[{}] Snapshot captured {} rows (INSERT events: {})",
                         scenarioName, snapshotRows.size(), insertRows.size());
@@ -322,6 +327,53 @@ public class MilvusCdcStreamingNodeE2E extends MilvusCdcE2ETestBase {
 
     @Test
     @Order(3)
+    @DisplayName("streaming_node full snapshot 1000 — DeliverPolicy.all at 1000-row scale")
+    void testFullSnapshotLarge() throws Exception {
+        Assumptions.assumeTrue(cdcAvailable, "StreamingNode CDC not available, skipping");
+        String scenarioName = "streaming_node.full_snapshot_1000";
+        String collectionName = "cdc_sn_snap1k";
+        String pgTable = "cdc_sn_snap1k";
+        int expectedCount = SNAPSHOT_COUNT_LARGE;
+        log.info("=== {} START ({} rows) ===", scenarioName, expectedCount);
+        try {
+            // Setup: insert 1000 rows
+            createCollection(collectionName, VECTOR_DIM);
+            insertData(collectionName, 0, expectedCount, VECTOR_DIM, 999L);
+            createPgTable(pgTable, VECTOR_DIM);
+
+            // Use V2 strategy with larger batch size for scale
+            try (CdcEventStreamStrategyV2 strategy =
+                    buildStreamingNodeStrategy(collectionName, 2000L);
+                    CdcMetricsCollector.ScenarioTimer timer =
+                            metrics.startScenario(scenarioName, expectedCount)) {
+
+                List<SeaTunnelRowWithPosition> snapshotRows =
+                        pollForEvents(strategy, collectionName, 30000, null);
+                List<SeaTunnelRow> insertRows = extractRowsByKind(snapshotRows, RowKind.INSERT);
+                log.info("[{}] Snapshot captured {} rows (INSERT events: {})",
+                        scenarioName, snapshotRows.size(), insertRows.size());
+
+                int applied = applyRowsToPg(pgTable, snapshotRows, VECTOR_DIM);
+                timer.actualRows(applied);
+
+                verifyPgCount(pgTable, expectedCount);
+                verifyVectorSimilarity(scenarioName, collectionName, pgTable, VECTOR_DIM, SAMPLE_SIZE);
+                verifyScalarFields(scenarioName, collectionName, pgTable, SAMPLE_SIZE);
+
+                assertTrue(applied >= expectedCount,
+                        "Snapshot row count mismatch: applied=" + applied
+                                + " < expected=" + expectedCount);
+                log.info("[{}] Large snapshot verified: {} rows synced to pgvector", scenarioName, applied);
+            }
+            log.info("=== {} END ===", scenarioName);
+        } finally {
+            dropCollection(collectionName);
+            dropPgTable(pgTable);
+        }
+    }
+
+    @Test
+    @Order(4)
     @DisplayName("streaming_node incremental insert — new rows captured via WAL stream")
     void testIncrementalInsert() throws Exception {
         Assumptions.assumeTrue(cdcAvailable, "StreamingNode CDC not available, skipping");
@@ -339,7 +391,7 @@ public class MilvusCdcStreamingNodeE2E extends MilvusCdcE2ETestBase {
             ReplicatePosition checkpoint;
             try (CdcEventStreamStrategyV2 strategy = buildStreamingNodeStrategy(collectionName)) {
                 List<SeaTunnelRowWithPosition> snapshotRows =
-                        pollForEvents(strategy, collectionName, 30000, null);
+                        pollForEvents(strategy, collectionName, 15000, null);
                 assertFalse(snapshotRows.isEmpty(), "Snapshot should have events");
                 checkpoint = snapshotRows.get(snapshotRows.size() - 1).getPosition();
                 int snapshotApplied = applyRowsToPg(pgTable, snapshotRows, VECTOR_DIM);
@@ -358,7 +410,7 @@ public class MilvusCdcStreamingNodeE2E extends MilvusCdcE2ETestBase {
                             metrics.startScenario(scenarioName, INSERT_COUNT)) {
 
                 List<SeaTunnelRowWithPosition> events =
-                        pollForEvents(strategy, collectionName, 30000, checkpoint);
+                        pollForEvents(strategy, collectionName, 15000, checkpoint);
 
                 List<SeaTunnelRow> insertRows = extractRowsByKind(events, RowKind.INSERT);
                 log.info("[{}] Captured {} INSERT events (expected {})",
@@ -380,7 +432,7 @@ public class MilvusCdcStreamingNodeE2E extends MilvusCdcE2ETestBase {
     }
 
     @Test
-    @Order(4)
+    @Order(5)
     @DisplayName("streaming_node delete capture — RowKind.DELETE events from WAL (core)")
     void testDeleteCapture() throws Exception {
         Assumptions.assumeTrue(cdcAvailable, "StreamingNode CDC not available, skipping");
@@ -398,7 +450,7 @@ public class MilvusCdcStreamingNodeE2E extends MilvusCdcE2ETestBase {
             ReplicatePosition checkpoint;
             try (CdcEventStreamStrategyV2 strategy = buildStreamingNodeStrategy(collectionName)) {
                 List<SeaTunnelRowWithPosition> snapshotRows =
-                        pollForEvents(strategy, collectionName, 30000, null);
+                        pollForEvents(strategy, collectionName, 15000, null);
                 assertFalse(snapshotRows.isEmpty(), "Snapshot should have events");
                 checkpoint = snapshotRows.get(snapshotRows.size() - 1).getPosition();
                 applyRowsToPg(pgTable, snapshotRows, VECTOR_DIM);
@@ -420,7 +472,7 @@ public class MilvusCdcStreamingNodeE2E extends MilvusCdcE2ETestBase {
                             metrics.startScenario(scenarioName, DELETE_COUNT)) {
 
                 List<SeaTunnelRowWithPosition> events =
-                        pollForEvents(strategy, collectionName, 30000, checkpoint);
+                        pollForEvents(strategy, collectionName, 15000, checkpoint);
 
                 List<SeaTunnelRow> deleteRows = extractRowsByKind(events, RowKind.DELETE);
                 log.info("[{}] Captured {} DELETE events (expected {})",
@@ -448,7 +500,69 @@ public class MilvusCdcStreamingNodeE2E extends MilvusCdcE2ETestBase {
     }
 
     @Test
-    @Order(5)
+    @Order(6)
+    @DisplayName("streaming_node upsert capture — same-PK updates captured as INSERT via WAL")
+    void testUpsertCapture() throws Exception {
+        Assumptions.assumeTrue(cdcAvailable, "StreamingNode CDC not available, skipping");
+        String scenarioName = "streaming_node.upsert_capture";
+        String collectionName = "cdc_sn_upsert";
+        String pgTable = "cdc_sn_upsert";
+        int upsertCount = 50;
+        log.info("=== {} START ===", scenarioName);
+        try {
+            // Setup: initial data
+            createCollection(collectionName, VECTOR_DIM);
+            insertData(collectionName, 0, SNAPSHOT_COUNT, VECTOR_DIM, 400L);
+            createPgTable(pgTable, VECTOR_DIM);
+
+            // Phase 1: Snapshot via V2 strategy (DeliverPolicy.all)
+            ReplicatePosition checkpoint;
+            try (CdcEventStreamStrategyV2 strategy = buildStreamingNodeStrategy(collectionName)) {
+                List<SeaTunnelRowWithPosition> snapshotRows =
+                        pollForEvents(strategy, collectionName, 30000, null);
+                assertFalse(snapshotRows.isEmpty(), "Snapshot should have events");
+                checkpoint = snapshotRows.get(snapshotRows.size() - 1).getPosition();
+                applyRowsToPg(pgTable, snapshotRows, VECTOR_DIM);
+                verifyPgCount(pgTable, SNAPSHOT_COUNT);
+                log.info("[{}] Snapshot phase complete, checkpoint messageId={}",
+                        scenarioName, checkpoint != null ? checkpoint.getMessageId() : "null");
+            }
+
+            // Upsert rows 0..49 (same PK, different vectors)
+            upsertData(collectionName, 0, upsertCount, VECTOR_DIM, 900L);
+            log.info("[{}] Upserted {} rows (id 0..{}) in Milvus",
+                    scenarioName, upsertCount, upsertCount - 1);
+
+            // Phase 2: Incremental via V2 strategy (DeliverPolicy.startAfter checkpoint)
+            try (CdcEventStreamStrategyV2 strategy = buildStreamingNodeStrategy(collectionName);
+                    CdcMetricsCollector.ScenarioTimer timer =
+                            metrics.startScenario(scenarioName, upsertCount)) {
+
+                List<SeaTunnelRowWithPosition> events =
+                        pollForEvents(strategy, collectionName, 15000, checkpoint);
+
+                List<SeaTunnelRow> insertRows = extractRowsByKind(events, RowKind.INSERT);
+                log.info("[{}] Captured {} INSERT events (expected {} upsert rows)",
+                        scenarioName, insertRows.size(), upsertCount);
+
+                int applied = applyRowsToPg(pgTable, events, VECTOR_DIM);
+                timer.actualRows(applied);
+
+                // Verify: pgvector count should remain SNAPSHOT_COUNT (upsert, not insert)
+                verifyPgCount(pgTable, SNAPSHOT_COUNT);
+                log.info("[{}] Upsert capture verified: {} INSERT events applied, "
+                        + "pgvector count still {} (upsert via ON CONFLICT)",
+                        scenarioName, applied, SNAPSHOT_COUNT);
+            }
+            log.info("=== {} END ===", scenarioName);
+        } finally {
+            dropCollection(collectionName);
+            dropPgTable(pgTable);
+        }
+    }
+
+    @Test
+    @Order(7)
     @DisplayName("streaming_node checkpoint recovery — DeliverPolicy.startAfter")
     void testCheckpointRecovery() throws Exception {
         Assumptions.assumeTrue(cdcAvailable, "StreamingNode CDC not available, skipping");
@@ -500,7 +614,7 @@ public class MilvusCdcStreamingNodeE2E extends MilvusCdcE2ETestBase {
     }
 
     @Test
-    @Order(6)
+    @Order(8)
     @DisplayName("streaming_node unavailable fallback — wrong pchannel yields isAvailable=false")
     void testUnavailableFallback() throws Exception {
         String scenarioName = "streaming_node.unavailable_fallback";
