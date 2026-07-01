@@ -21,6 +21,8 @@ import org.apache.seatunnel.connectors.streaming.proto.ConsumeRequest;
 import org.apache.seatunnel.connectors.streaming.proto.ConsumeResponse;
 import org.apache.seatunnel.connectors.streaming.proto.CreateVChannelConsumerResponse;
 import org.apache.seatunnel.connectors.streaming.proto.ImmutableMessage;
+import org.apache.seatunnel.connectors.streaming.proto.StreamingCode;
+import org.apache.seatunnel.connectors.streaming.proto.StreamingError;
 import org.apache.seatunnel.connectors.streaming.proto.StreamingNodeHandlerServiceGrpc;
 
 import io.grpc.Status;
@@ -32,6 +34,8 @@ import java.util.Iterator;
 import java.util.NoSuchElementException;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * ConsumeStream wraps a bidirectional gRPC stream for reading WAL messages.
@@ -60,6 +64,14 @@ public class ConsumeStream implements Iterator<ImmutableMessage>, AutoCloseable 
 
     // Error from server (if any)
     private volatile Throwable streamError = null;
+
+    // Error from CreateVChannelConsumerResponse (if any)
+    private volatile StreamingCode createVchannelErrorCode = null;
+    private volatile String createVchannelErrorCause = null;
+
+    // Pattern to extract expected term from UNMATCHED_CHANNEL_TERM error cause
+    private static final Pattern EXPECTED_TERM_PATTERN =
+            Pattern.compile("expected[=: ]+term[=: ]+(\\d+)", Pattern.CASE_INSENSITIVE);
 
     /**
      * Constructor: creates a bidirectional stream and sends initial CreateVChannelConsumerRequest.
@@ -93,8 +105,13 @@ public class ConsumeStream implements Iterator<ImmutableMessage>, AutoCloseable 
                 } else if (response.hasCreateVchannel()) {
                     CreateVChannelConsumerResponse vcResp = response.getCreateVchannel();
                     if (vcResp.hasError()) {
+                        StreamingError err = vcResp.getError();
+                        createVchannelErrorCode = err.getCode();
+                        createVchannelErrorCause = err.getCause();
                         log.warn("CreateVChannelConsumer failed for pchannel={}: code={}, cause={}",
-                                pchannelName, vcResp.getError().getCode(), vcResp.getError().getCause());
+                                pchannelName, createVchannelErrorCode, createVchannelErrorCause);
+                        // VChannel consumer creation failed — stream is not usable.
+                        isOpen = false;
                     } else {
                         log.info("VChannel consumer created for pchannel={}, consumerId={}",
                                 pchannelName, vcResp.getConsumerId());
@@ -164,7 +181,7 @@ public class ConsumeStream implements Iterator<ImmutableMessage>, AutoCloseable 
 
         // Stream still open, wait briefly for messages
         try {
-            ImmutableMessage msg = messageQueue.poll(100, TimeUnit.MILLISECONDS);
+            ImmutableMessage msg = messageQueue.poll(50, TimeUnit.MILLISECONDS);
             if (msg != null) {
                 // Put it back for next() to retrieve
                 messageQueue.put(msg);
@@ -176,7 +193,8 @@ public class ConsumeStream implements Iterator<ImmutableMessage>, AutoCloseable 
         }
 
         // Still open but no message arrived in 100ms
-        return true;  // Assume more messages will come (stream still open)
+        // Return false to avoid blocking next() — caller should poll again.
+        return false;
     }
 
     /**
@@ -193,7 +211,7 @@ public class ConsumeStream implements Iterator<ImmutableMessage>, AutoCloseable 
         }
 
         try {
-            ImmutableMessage message = messageQueue.poll(5, TimeUnit.SECONDS);  // Block up to 5s
+            ImmutableMessage message = messageQueue.poll(2, TimeUnit.SECONDS);  // Block up to 2s
             if (message != null) {
                 return message;
             } else {
@@ -243,5 +261,51 @@ public class ConsumeStream implements Iterator<ImmutableMessage>, AutoCloseable 
      */
     public Throwable getStreamError() {
         return streamError;
+    }
+
+    /**
+     * Get the error code from CreateVChannelConsumerResponse (if any).
+     */
+    public StreamingCode getCreateVchannelErrorCode() {
+        return createVchannelErrorCode;
+    }
+
+    /**
+     * Get the error cause string from CreateVChannelConsumerResponse (if any).
+     */
+    public String getCreateVchannelErrorCause() {
+        return createVchannelErrorCause;
+    }
+
+    /**
+     * If the vchannel consumer creation failed with UNMATCHED_CHANNEL_TERM,
+     * attempt to extract the expected term from the error cause string.
+     *
+     * @return the expected term, or -1 if it cannot be determined
+     */
+    public long getExpectedTermFromError() {
+        if (createVchannelErrorCode != StreamingCode.STREAMING_CODE_UNMATCHED_CHANNEL_TERM) {
+            return -1;
+        }
+        if (createVchannelErrorCause == null || createVchannelErrorCause.isEmpty()) {
+            return -1;
+        }
+        Matcher m = EXPECTED_TERM_PATTERN.matcher(createVchannelErrorCause);
+        if (m.find()) {
+            try {
+                return Long.parseLong(m.group(1));
+            } catch (NumberFormatException e) {
+                log.debug("Failed to parse expected term from cause: {}", createVchannelErrorCause);
+            }
+        }
+        // Fallback: try to find any number in the cause string
+        Matcher anyNum = Pattern.compile("\\d+").matcher(createVchannelErrorCause);
+        if (anyNum.find()) {
+            try {
+                return Long.parseLong(anyNum.group());
+            } catch (NumberFormatException ignored) {
+            }
+        }
+        return -1;
     }
 }

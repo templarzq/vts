@@ -148,8 +148,8 @@ public class StreamingMessageParser {
 
             List<io.milvus.grpc.FieldData> fieldsDataList = insertRequest.getFieldsDataList();
             if (fieldsDataList.isEmpty()) {
-                log.debug("InsertRequest has no fields_data, collection={}",
-                        insertRequest.getCollectionName());
+                log.warn("InsertRequest has no fields_data, collection={}, numRows={}",
+                        insertRequest.getCollectionName(), insertRequest.getNumRows());
                 return rows;
             }
 
@@ -159,7 +159,7 @@ public class StreamingMessageParser {
                 numRows = getFieldDataRowCount(fieldsDataList.get(0));
             }
             if (numRows <= 0) {
-                log.debug("InsertRequest has 0 rows");
+                log.warn("InsertRequest has 0 rows, collection={}", insertRequest.getCollectionName());
                 return rows;
             }
 
@@ -171,6 +171,9 @@ public class StreamingMessageParser {
                     fieldDataMap.put(fieldName, fd);
                 }
             }
+            log.debug("InsertRequest: collection={}, numRows={}, fields=[{}]",
+                    insertRequest.getCollectionName(), numRows,
+                    String.join(",", fieldDataMap.keySet()));
 
             // Get field schemas from collection description
             List<CreateCollectionReq.FieldSchema> fieldSchemas =

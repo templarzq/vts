@@ -25,6 +25,7 @@ import org.apache.seatunnel.connectors.streaming.proto.DeliverPolicy;
 import org.apache.seatunnel.connectors.streaming.proto.GetReplicateCheckpointRequest;
 import org.apache.seatunnel.connectors.streaming.proto.GetReplicateCheckpointResponse;
 import org.apache.seatunnel.connectors.streaming.proto.ImmutableMessage;
+import org.apache.seatunnel.connectors.streaming.proto.PChannelAccessMode;
 import org.apache.seatunnel.connectors.streaming.proto.PChannelInfo;
 import org.apache.seatunnel.connectors.streaming.proto.ReplicateCheckpoint;
 import org.apache.seatunnel.connectors.streaming.proto.StreamingNodeHandlerServiceGrpc;
@@ -160,6 +161,46 @@ public class StreamingNodeHandlerClient implements AutoCloseable {
         return checkpoint != null
                 && !checkpoint.getPchannel().isEmpty()
                 && !checkpoint.getMessageId().isEmpty();
+    }
+
+    /**
+     * Discover the current term for a pchannel by probing with GetReplicateCheckpoint RPC.
+     * This is a fast unary RPC (~5ms per attempt), much faster than creating Consume streams.
+     *
+     * <p>In standalone mode, GetReplicateCheckpoint may return FAILED_PRECONDITION for all
+     * terms, in which case -1 is returned and the caller should fall back to Consume probing.
+     *
+     * @param pchannelName pchannel name
+     * @return the current term, or -1 if it cannot be determined via checkpoint RPC
+     */
+    public long discoverTerm(String pchannelName) {
+        // Probe with GetReplicateCheckpoint (fast unary RPC, ~5ms).
+        // If the RPC validates terms, we find it quickly. If not (standalone mode),
+        // all attempts return FAILED_PRECONDITION and we return -1.
+        for (long t = 1; t <= 40; t++) {
+            try {
+                PChannelInfo pchannel = PChannelInfo.newBuilder()
+                        .setName(pchannelName)
+                        .setTerm(t)
+                        .setAccessMode(PChannelAccessMode.PCHANNEL_ACCESS_READONLY)
+                        .build();
+                GetReplicateCheckpointRequest request =
+                        GetReplicateCheckpointRequest.newBuilder().setPchannel(pchannel).build();
+                GetReplicateCheckpointResponse response = blockingStub
+                        .withDeadlineAfter(3000, TimeUnit.MILLISECONDS)
+                        .getReplicateCheckpoint(request);
+                if (response.hasCheckpoint() && !response.getCheckpoint().getMessageId().isEmpty()) {
+                    log.info("discoverTerm: GetReplicateCheckpoint succeeded for pchannel={} term={}",
+                            pchannelName, t);
+                    return t;
+                }
+            } catch (io.grpc.StatusRuntimeException e) {
+                log.debug("discoverTerm: term={} failed with {}", t, e.getStatus().getCode());
+            }
+        }
+        log.info("discoverTerm: GetReplicateCheckpoint returned no valid checkpoint "
+                + "for pchannel={} (standalone mode), use Consume probing", pchannelName);
+        return -1;
     }
 
     /**
