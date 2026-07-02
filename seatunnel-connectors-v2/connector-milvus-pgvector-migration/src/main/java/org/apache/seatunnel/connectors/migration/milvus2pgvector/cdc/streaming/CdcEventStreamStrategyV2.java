@@ -56,8 +56,10 @@ import java.util.Optional;
  *       from checkpoint</li>
  *   <li><b>Delete capture</b> — {@code MessageTypeDelete} produces rows with
  *       {@code RowKind.DELETE}</li>
- *   <li><b>Upsert handling</b> — {@code MessageTypeUpsert} produces rows with
- *       {@code RowKind.INSERT} (sink handles upsert)</li>
+ *   <li><b>Upsert handling</b> — Milvus WAL has no separate Upsert message type;
+ *       upserts are decomposed into Delete+Insert pairs at the proxy level.
+ *       Insert messages produce {@code RowKind.INSERT} (sink treats as upsert),
+ *       Delete messages produce {@code RowKind.DELETE}</li>
  * </ul>
  */
 @Slf4j
@@ -176,8 +178,9 @@ public class CdcEventStreamStrategyV2 implements CdcStrategy {
 
     /**
      * Probe the pchannel by opening a Consume stream.
-     * First tries term=1, then extracts the expected term from UNMATCHED_CHANNEL_TERM
-     * error if that fails. Falls back to probing terms 2-20 as a last resort.
+     * Tries cached term first, then term=1. If that fails with UNMATCHED_CHANNEL_TERM,
+     * extracts the server's current term directly from the error and retries.
+     * No range probing — the term is obtained directly from the server response.
      * Returns true if the stream opens successfully, false otherwise.
      */
     private boolean probeConsumeStream(String pchannelCandidate) {
@@ -186,26 +189,20 @@ public class CdcEventStreamStrategyV2 implements CdcStrategy {
                 .setAll(Empty.newBuilder().build())
                 .build();
 
-        // Step 0: Fast path — use cached term or discover via checkpoint RPC.
+        // Step 1: Try cached term (from previous successful connection).
         long ct = cachedTerm;
-        if (ct <= 0) {
-            ct = streamingNodeClient.discoverTerm(pchannelCandidate);
-            if (ct > 0) {
-                cachedTerm = ct;
-            }
-        }
         if (ct > 0) {
             ConsumeStream stream = tryCreateStream(pchannelCandidate, vchannelCandidate, policy, ct);
             if (stream != null) {
                 stream.close();
-                log.debug("Consume probe succeeded for pchannel={}, term={} (cached/discovered)",
+                log.debug("Consume probe succeeded for pchannel={}, term={} (cached)",
                         pchannelCandidate, ct);
                 return true;
             }
             cachedTerm = -1;
         }
 
-        // Step 1: Try term=1 (typical for fresh deployments).
+        // Step 2: Try term=1 (typical for fresh deployments).
         long term = 1;
         ConsumeStream stream = tryCreateStream(pchannelCandidate, vchannelCandidate, policy, term);
         if (stream != null) {
@@ -213,39 +210,27 @@ public class CdcEventStreamStrategyV2 implements CdcStrategy {
             return true;
         }
 
-        // Step 2: Try expected term from UNMATCHED_CHANNEL_TERM error.
-        long expectedTerm = lastStreamExpectedTerm;
-        if (expectedTerm > 0 && expectedTerm != term) {
-            stream = tryCreateStream(pchannelCandidate, vchannelCandidate, policy, expectedTerm);
+        // Step 3: Extract the server's current term from UNMATCHED_CHANNEL_TERM error and retry.
+        long currentTerm = lastStreamCurrentTerm;
+        if (currentTerm > 0 && currentTerm != term) {
+            stream = tryCreateStream(pchannelCandidate, vchannelCandidate, policy, currentTerm);
             if (stream != null) {
                 stream.close();
-                log.info("Consume probe succeeded for pchannel={}, term={} (from error)",
-                        pchannelCandidate, expectedTerm);
-                return true;
-            }
-        }
-
-        // Step 3: Fallback — probe terms 2-20.
-        for (long t = 2; t <= 40; t++) {
-            if (t == expectedTerm) continue;
-            stream = tryCreateStream(pchannelCandidate, vchannelCandidate, policy, t);
-            if (stream != null) {
-                stream.close();
-                log.info("Consume probe succeeded for pchannel={}, term={} (fallback probe)",
-                        pchannelCandidate, t);
+                log.info("Consume probe succeeded for pchannel={}, term={} (from UNMATCHED_CHANNEL_TERM error)",
+                        pchannelCandidate, currentTerm);
                 return true;
             }
         }
         return false;
     }
 
-    /** Last ConsumeStream's expected term from UNMATCHED_CHANNEL_TERM error. */
-    private long lastStreamExpectedTerm = -1;
+    /** Last ConsumeStream's current term from UNMATCHED_CHANNEL_TERM error. */
+    private long lastStreamCurrentTerm = -1;
 
     /**
      * Try to create a Consume stream with the given term.
-     * If the stream fails with UNMATCHED_CHANNEL_TERM, stores the expected term
-     * in {@link #lastStreamExpectedTerm}.
+     * If the stream fails with UNMATCHED_CHANNEL_TERM, stores the server's current
+     * term in {@link #lastStreamCurrentTerm} for the next retry.
      *
      * @return the open ConsumeStream, or null if it failed
      */
@@ -273,13 +258,13 @@ public class CdcEventStreamStrategyV2 implements CdcStrategy {
                 return stream;
             }
 
-            // Extract expected term from error if available
-            long expected = stream.getExpectedTermFromError();
-            if (expected > 0) {
-                lastStreamExpectedTerm = expected;
-                cachedTerm = expected;
-                log.info("UNMATCHED_CHANNEL_TERM: server expects term={}, tried term={}",
-                        expected, term);
+            // Extract the server's current term from UNMATCHED_CHANNEL_TERM error
+            long currentTerm = stream.getCurrentTermFromError();
+            if (currentTerm > 0) {
+                lastStreamCurrentTerm = currentTerm;
+                cachedTerm = currentTerm;
+                log.info("UNMATCHED_CHANNEL_TERM: tried term={}, server current term={}",
+                        term, currentTerm);
             }
 
             try {
@@ -404,7 +389,9 @@ public class CdcEventStreamStrategyV2 implements CdcStrategy {
 
     /**
      * Try to open a Consume stream on the given pchannel.
-     * First tries term=1, then extracts the expected term from error, then probes.
+     * Tries cached term first, then term=1. If that fails with UNMATCHED_CHANNEL_TERM,
+     * extracts the server's current term directly from the error and retries.
+     * No range probing — the term is obtained directly from the server response.
      * Returns true if the stream was opened successfully.
      *
      * @param pchannelCandidate pchannel name to try
@@ -414,26 +401,20 @@ public class CdcEventStreamStrategyV2 implements CdcStrategy {
     private boolean tryOpenStream(String pchannelCandidate, DeliverPolicy policy) {
         String vchannelCandidate = pchannelCandidate + "_" + collectionId + "v0";
 
-        // Step 0: Fast path — use cached term or discover via checkpoint RPC.
+        // Step 1: Try cached term (from previous successful connection).
         long ct = cachedTerm;
-        if (ct <= 0) {
-            ct = streamingNodeClient.discoverTerm(pchannelCandidate);
-            if (ct > 0) {
-                cachedTerm = ct;
-            }
-        }
         if (ct > 0) {
             ConsumeStream stream = tryCreateStream(pchannelCandidate, vchannelCandidate, policy, ct);
             if (stream != null) {
                 consumeStream = stream;
-                log.debug("Consume stream opened for pchannel={}, term={} (cached/discovered)",
+                log.debug("Consume stream opened for pchannel={}, term={} (cached)",
                         pchannelCandidate, ct);
                 return true;
             }
             cachedTerm = -1;
         }
 
-        // Step 1: Try term=1.
+        // Step 2: Try term=1 (typical for fresh deployments).
         long term = 1;
         ConsumeStream stream = tryCreateStream(pchannelCandidate, vchannelCandidate, policy, term);
         if (stream != null) {
@@ -442,26 +423,14 @@ public class CdcEventStreamStrategyV2 implements CdcStrategy {
             return true;
         }
 
-        // Step 2: Try expected term from UNMATCHED_CHANNEL_TERM error.
-        long expectedTerm = lastStreamExpectedTerm;
-        if (expectedTerm > 0 && expectedTerm != term) {
-            stream = tryCreateStream(pchannelCandidate, vchannelCandidate, policy, expectedTerm);
+        // Step 3: Extract the server's current term from UNMATCHED_CHANNEL_TERM error and retry.
+        long currentTerm = lastStreamCurrentTerm;
+        if (currentTerm > 0 && currentTerm != term) {
+            stream = tryCreateStream(pchannelCandidate, vchannelCandidate, policy, currentTerm);
             if (stream != null) {
                 consumeStream = stream;
-                log.info("Consume stream opened for pchannel={}, term={} (from error)",
-                        pchannelCandidate, expectedTerm);
-                return true;
-            }
-        }
-
-        // Step 3: Fallback probe.
-        for (long t = 2; t <= 40; t++) {
-            if (t == expectedTerm) continue;
-            stream = tryCreateStream(pchannelCandidate, vchannelCandidate, policy, t);
-            if (stream != null) {
-                consumeStream = stream;
-                log.info("Consume stream opened for pchannel={}, term={} (fallback probe)",
-                        pchannelCandidate, t);
+                log.info("Consume stream opened for pchannel={}, term={} (from UNMATCHED_CHANNEL_TERM error)",
+                        pchannelCandidate, currentTerm);
                 return true;
             }
         }

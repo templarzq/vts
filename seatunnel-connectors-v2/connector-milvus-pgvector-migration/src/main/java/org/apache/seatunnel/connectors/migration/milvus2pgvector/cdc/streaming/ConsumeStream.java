@@ -69,9 +69,11 @@ public class ConsumeStream implements Iterator<ImmutableMessage>, AutoCloseable 
     private volatile StreamingCode createVchannelErrorCode = null;
     private volatile String createVchannelErrorCause = null;
 
-    // Pattern to extract expected term from UNMATCHED_CHANNEL_TERM error cause
-    private static final Pattern EXPECTED_TERM_PATTERN =
-            Pattern.compile("expected[=: ]+term[=: ]+(\\d+)", Pattern.CASE_INSENSITIVE);
+    // Pattern to extract the server's current term from UNMATCHED_CHANNEL_TERM error cause.
+    // Milvus error format: "channel <name> at term <clientTerm> is expected, but current term is <serverTerm>"
+    // The client must retry with <serverTerm> (the number after "current term is").
+    private static final Pattern CURRENT_TERM_PATTERN =
+            Pattern.compile("current term is (\\d+)", Pattern.CASE_INSENSITIVE);
 
     /**
      * Constructor: creates a bidirectional stream and sends initial CreateVChannelConsumerRequest.
@@ -279,33 +281,31 @@ public class ConsumeStream implements Iterator<ImmutableMessage>, AutoCloseable 
 
     /**
      * If the vchannel consumer creation failed with UNMATCHED_CHANNEL_TERM,
-     * attempt to extract the expected term from the error cause string.
+     * extract the server's current term from the error cause string.
      *
-     * @return the expected term, or -1 if it cannot be determined
+     * <p>Milvus error format:
+     * <pre>"channel &lt;name&gt; at term &lt;clientTerm&gt; is expected, but current term is &lt;serverTerm&gt;"</pre>
+     * The client must retry with {@code <serverTerm>}.
+     *
+     * @return the server's current term, or -1 if it cannot be determined
      */
-    public long getExpectedTermFromError() {
+    public long getCurrentTermFromError() {
         if (createVchannelErrorCode != StreamingCode.STREAMING_CODE_UNMATCHED_CHANNEL_TERM) {
             return -1;
         }
         if (createVchannelErrorCause == null || createVchannelErrorCause.isEmpty()) {
             return -1;
         }
-        Matcher m = EXPECTED_TERM_PATTERN.matcher(createVchannelErrorCause);
+        Matcher m = CURRENT_TERM_PATTERN.matcher(createVchannelErrorCause);
         if (m.find()) {
             try {
                 return Long.parseLong(m.group(1));
             } catch (NumberFormatException e) {
-                log.debug("Failed to parse expected term from cause: {}", createVchannelErrorCause);
+                log.warn("Failed to parse current term from cause: {}", createVchannelErrorCause);
             }
         }
-        // Fallback: try to find any number in the cause string
-        Matcher anyNum = Pattern.compile("\\d+").matcher(createVchannelErrorCause);
-        if (anyNum.find()) {
-            try {
-                return Long.parseLong(anyNum.group());
-            } catch (NumberFormatException ignored) {
-            }
-        }
+        log.warn("UNMATCHED_CHANNEL_TERM error cause does not contain 'current term is <N>': {}",
+                createVchannelErrorCause);
         return -1;
     }
 }
