@@ -132,10 +132,13 @@ public class CdcEventStreamStrategy implements CdcStrategy {
             log.warn("event_stream CDC isAvailable()=false: cdc_pchannel is not configured");
             return false;
         }
-        
-        // For standalone Milvus, event_stream strategy can work with a fallback mechanism
-        // (using default MessageID when GetReplicateInfo is not available).
-        // For replication topology, GetReplicateInfo must be available.
+
+        // DumpMessages API requires a startMessageID obtained from GetReplicateInfo.
+        // Without a valid checkpoint, V1 (DumpMessages-based) strategy cannot bootstrap
+        // the stream. GetReplicateInfo is only available in replication topology
+        // (secondary clusters); in standalone mode it returns empty/fails, and the
+        // DumpMessages fallback (default MessageID) does not work because the API
+        // needs a concrete start position. Therefore V1 is unavailable in standalone mode.
         try {
             Optional<ReplicateCheckpoint> cp =
                     grpcClient.getReplicateInfo(sourceClusterId, targetPchannel);
@@ -144,19 +147,17 @@ public class CdcEventStreamStrategy implements CdcStrategy {
                         + "for pchannel={} (replication topology)", targetPchannel);
                 return true;
             } else {
-                // GetReplicateInfo returned empty checkpoint - this indicates standalone mode
-                // We can still proceed with a fallback MessageID
-                log.info("event_stream CDC available with fallback: GetReplicateInfo returned no checkpoint "
-                        + "for pchannel={} (standalone mode, will use default MessageID)", targetPchannel);
-                return true;
+                log.warn("event_stream CDC isAvailable()=false: GetReplicateInfo returned no "
+                        + "checkpoint for pchannel={} (standalone mode is not supported by the "
+                        + "DumpMessages-based V1 strategy; use StreamingNode V2 strategy instead)",
+                        targetPchannel);
+                return false;
             }
         } catch (Exception e) {
-            // GetReplicateInfo RPC failed - likely standalone mode without replication support
-            // We can still proceed with a fallback MessageID
-            log.info("event_stream CDC available with fallback: GetReplicateInfo RPC failed for pchannel={} "
-                        + "(standalone mode detected, will use default MessageID): {}", 
-                        targetPchannel, e.getMessage());
-            return true;
+            log.warn("event_stream CDC isAvailable()=false: GetReplicateInfo RPC failed for "
+                    + "pchannel={} (standalone mode not supported by V1 strategy): {}",
+                    targetPchannel, e.getMessage());
+            return false;
         }
     }
 
