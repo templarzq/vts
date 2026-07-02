@@ -65,6 +65,9 @@ public class ConsumeStream implements Iterator<ImmutableMessage>, AutoCloseable 
     // Error from server (if any)
     private volatile Throwable streamError = null;
 
+    // gRPC status code from onError (if the error is a StatusRuntimeException)
+    private volatile io.grpc.Status.Code grpcStatusCode = null;
+
     // Error from CreateVChannelConsumerResponse (if any)
     private volatile StreamingCode createVchannelErrorCode = null;
     private volatile String createVchannelErrorCause = null;
@@ -130,6 +133,7 @@ public class ConsumeStream implements Iterator<ImmutableMessage>, AutoCloseable 
             public void onError(Throwable t) {
                 if (t instanceof StatusRuntimeException) {
                     Status status = ((StatusRuntimeException) t).getStatus();
+                    grpcStatusCode = status.getCode();
                     log.error("Consume stream error for pchannel={}: code={}, description={}, cause={}",
                             pchannelName, status.getCode(), status.getDescription(),
                             status.getCause() != null ? status.getCause().getMessage() : "none");
@@ -263,6 +267,16 @@ public class ConsumeStream implements Iterator<ImmutableMessage>, AutoCloseable 
      */
     public Throwable getStreamError() {
         return streamError;
+    }
+
+    /**
+     * Get the gRPC status code from the stream error (if any).
+     * Only set when the error is a {@link io.grpc.StatusRuntimeException}.
+     *
+     * @return gRPC status code, or null if no error or error is not gRPC-related
+     */
+    public io.grpc.Status.Code getGrpcStatusCode() {
+        return grpcStatusCode;
     }
 
     /**

@@ -72,6 +72,7 @@ public class CdcEventStreamStrategyV2 implements CdcStrategy {
     private final long collectionId;
     private final long maxEventsPerPoll;
     private final String sourceClusterId;
+    private final PChannelResolver pchannelResolver;
 
     /** Live Consume stream cursor; kept across polls to avoid re-opening. */
     private ConsumeStream consumeStream;
@@ -108,6 +109,11 @@ public class CdcEventStreamStrategyV2 implements CdcStrategy {
                 config.getChannelTimeoutMs());
 
         this.parser = new StreamingMessageParser(collectionDesc, config.getPrimaryKeyField());
+
+        // Initialize pchannel resolver for etcd-based auto-discovery
+        this.pchannelResolver = new PChannelResolver(
+                config.getCdcEtcdEndpoint(),
+                extractRootPath(config));
 
         log.info("CdcEventStreamStrategyV2 initialized: pchannel={}, vchannel={}, collectionId={}, streamingNode={}",
                 pchannelName, vchannelName, collectionId, streamingNodeAddress);
@@ -163,15 +169,24 @@ public class CdcEventStreamStrategyV2 implements CdcStrategy {
             return false;
         }
 
-        // Step 2: Validate the pchannel by trying to open a Consume stream with term=1.
-        // A valid pchannel will succeed; an invalid pchannel name will fail.
-        boolean pchannelValid = probeConsumeStream(pchannelName);
+        // Step 2: Validate the pchannel.
+        // Try the configured pchannel first, then auto-discover from etcd.
+        String resolvedPchan = resolvePchannelFromEtcd();
+        String channelToProbe = resolvedPchan != null ? resolvedPchan : pchannelName;
+
+        boolean pchannelValid = probeConsumeStream(channelToProbe);
         if (pchannelValid) {
             log.info("StreamingNode gRPC available for pchannel={} (Consume probe succeeded)",
-                    pchannelName);
-        } else {
+                    channelToProbe);
+        } else if (resolvedPchan == null) {
             log.warn("StreamingNode gRPC service reachable but pchannel={} is invalid "
-                    + "(Consume probe failed for term=1)", pchannelName);
+                    + "(Consume probe failed for term=1). "
+                    + "No etcd mapping found for collectionId={} either.",
+                    pchannelName, collectionId);
+        } else {
+            log.warn("StreamingNode gRPC service reachable but both configured pchannel={} "
+                    + "and etcd-resolved pchannel={} are invalid",
+                    pchannelName, resolvedPchan);
         }
         return pchannelValid;
     }
@@ -265,6 +280,15 @@ public class CdcEventStreamStrategyV2 implements CdcStrategy {
                 cachedTerm = currentTerm;
                 log.info("UNMATCHED_CHANNEL_TERM: tried term={}, server current term={}",
                         term, currentTerm);
+            } else {
+                // Fallback: try to extract term from FAILED_PRECONDITION stream error
+                currentTerm = extractCurrentTermFromStreamError(stream);
+                if (currentTerm > 0) {
+                    lastStreamCurrentTerm = currentTerm;
+                    cachedTerm = currentTerm;
+                    log.info("FAILED_PRECONDITION: tried term={}, server current term={}",
+                            term, currentTerm);
+                }
             }
 
             try {
@@ -279,6 +303,55 @@ public class CdcEventStreamStrategyV2 implements CdcStrategy {
     }
 
     /**
+     * Try to extract the server's current term from a FAILED_PRECONDITION stream error.
+     * When the server rejects the stream with FAILED_PRECONDITION (e.g., term mismatch),
+     * the current term may be embedded in the gRPC status description.
+     *
+     * @param stream the failed ConsumeStream
+     * @return the server's current term, or -1 if it cannot be determined
+     */
+    private long extractCurrentTermFromStreamError(ConsumeStream stream) {
+        if (stream.getGrpcStatusCode() != io.grpc.Status.Code.FAILED_PRECONDITION) {
+            return -1;
+        }
+        Throwable streamError = stream.getStreamError();
+        if (!(streamError instanceof io.grpc.StatusRuntimeException)) {
+            return -1;
+        }
+        String desc = ((io.grpc.StatusRuntimeException) streamError).getStatus().getDescription();
+        if (desc == null || desc.isEmpty()) {
+            return -1;
+        }
+        java.util.regex.Matcher m = java.util.regex.Pattern
+                .compile("current term is (\\d+)", java.util.regex.Pattern.CASE_INSENSITIVE)
+                .matcher(desc);
+        if (m.find()) {
+            try {
+                return Long.parseLong(m.group(1));
+            } catch (NumberFormatException ignored) {
+            }
+        }
+        return -1;
+    }
+
+    /**
+     * Extract the root path from the configured pchannel (e.g. "by-dev" from
+     * "by-dev-rootcoord-dml_0") or from the Milvus URL as fallback.
+     */
+    private static String extractRootPath(MilvusCdcSourceConfig config) {
+        String pchannel = config.getCdcPchannel();
+        if (pchannel != null && pchannel.contains("-rootcoord-dml_")) {
+            return pchannel.substring(0, pchannel.indexOf("-rootcoord-dml_"));
+        }
+        // Default root path for Milvus
+        return "by-dev";
+    }
+
+    /** Recovery retry counter — reset on successful poll, incremented on FAILED_PRECONDITION. */
+    private int recoveryRetryCount = 0;
+    private static final int MAX_RECOVERY_RETRIES = 3;
+
+    /**
      * Poll for incremental changes since the given position.
      *
      * @param split         the incremental split being read
@@ -290,9 +363,38 @@ public class CdcEventStreamStrategyV2 implements CdcStrategy {
     public List<SeaTunnelRowWithPosition> pollChanges(
             MilvusCdcSourceSplit split, ReplicatePosition startPosition) throws Exception {
 
-        // Open stream if not already open or if startPosition changed
+        // Open stream if not already open or if startPosition changed.
+        // If the previous stream failed with FAILED_PRECONDITION, reset the
+        // term cache and re-acquire pchannel info before re-opening.
         if (consumeStream == null || !consumeStream.isOpen()) {
-            openStream(startPosition);
+            if (consumeStream != null && !consumeStream.isOpen()
+                    && consumeStream.getGrpcStatusCode() == io.grpc.Status.Code.FAILED_PRECONDITION) {
+                recoveryRetryCount++;
+                if (recoveryRetryCount > MAX_RECOVERY_RETRIES) {
+                    log.error("FAILED_PRECONDITION recovery exceeded max retries ({}) for pchannel={}",
+                            MAX_RECOVERY_RETRIES, pchannelName);
+                    throw new RuntimeException(
+                            "FAILED_PRECONDITION recovery exceeded max retries for pchannel="
+                                    + pchannelName);
+                }
+                log.warn("Consume stream closed with FAILED_PRECONDITION for pchannel={}, "
+                        + "resetting term cache and re-establishing stream (retry {}/{})",
+                        pchannelName, recoveryRetryCount, MAX_RECOVERY_RETRIES);
+                // Reset cached term to force fresh term probing from server
+                cachedTerm = -1;
+                lastStreamCurrentTerm = -1;
+                try {
+                    consumeStream.close();
+                } catch (Exception ignored) {
+                }
+                consumeStream = null;
+            }
+            // Resume from last consumed position if recovering, otherwise use caller's position
+            if (consumeStream == null) {
+                openStream(lastPosition != null ? lastPosition : startPosition);
+            } else {
+                openStream(startPosition);
+            }
         }
 
         List<SeaTunnelRowWithPosition> results = new ArrayList<>();
@@ -328,7 +430,13 @@ public class CdcEventStreamStrategyV2 implements CdcStrategy {
             }
         } catch (Exception e) {
             log.warn("Error polling changes: {}", e.getMessage());
-            // Return partial results
+            // Return partial results — FAILED_PRECONDITION recovery will trigger
+            // on the next poll call when the closed stream is detected.
+        }
+
+        // Reset recovery counter on successful poll
+        if (consumeStream != null && consumeStream.isOpen()) {
+            recoveryRetryCount = 0;
         }
 
         log.info("Poll completed: {} events, {} rows", eventCount, results.size());
@@ -336,9 +444,25 @@ public class CdcEventStreamStrategyV2 implements CdcStrategy {
     }
 
     /**
+     * Resolve the correct pchannel for this collection from etcd.
+     * @return the etcd-resolved pchannel, or null if not found
+     */
+    private String resolvePchannelFromEtcd() {
+        try {
+            String resolved = pchannelResolver.resolvePChannel(collectionId);
+            if (resolved != null) {
+                log.info("Resolved pchannel from etcd: {} for collectionId={}", resolved, collectionId);
+                return resolved;
+            }
+        } catch (Exception e) {
+            log.debug("Failed to resolve pchannel from etcd: {}", e.getMessage());
+        }
+        return null;
+    }
+
+    /**
      * Open the Consume stream with the appropriate DeliverPolicy.
-     * Auto-detects the correct pchannel by trying all pchannels (0-15) if the
-     * configured pchannel doesn't work.
+     * Auto-detects the correct pchannel: configured → etcd → scan (0-15).
      *
      * @param startPosition Optional starting position (null for full snapshot)
      */
@@ -363,18 +487,31 @@ public class CdcEventStreamStrategyV2 implements CdcStrategy {
             log.info("Opening Consume stream for full snapshot: DeliverPolicy.all");
         }
 
-        // Try the configured pchannel first, then auto-detect if it fails
+        // Step 1: Try the configured pchannel
         if (tryOpenStream(pchannelName, policy)) {
             return;
         }
 
-        // Auto-detect: try all pchannels (0-15)
-        log.info("Configured pchannel {} failed; auto-detecting correct pchannel for collectionId={}",
-                pchannelName, collectionId);
+        // Step 2: Try the etcd-resolved pchannel for this collection
+        String etcdPchan = resolvePchannelFromEtcd();
+        if (etcdPchan != null && !etcdPchan.equals(pchannelName)) {
+            log.info("Trying etcd-resolved pchannel: {} for collectionId={}", etcdPchan, collectionId);
+            if (tryOpenStream(etcdPchan, policy)) {
+                log.info("Successfully opened stream on etcd-resolved pchannel: {}", etcdPchan);
+                return;
+            }
+        }
+
+        // Step 3: Auto-detect: try all pchannels (0-15)
+        log.info("Configured and etcd pchannels failed; auto-detecting for collectionId={}",
+                collectionId);
         for (int i = 0; i < 16; i++) {
             String candidatePchannel = "by-dev-rootcoord-dml_" + i;
             if (candidatePchannel.equals(pchannelName)) {
                 continue;  // Already tried
+            }
+            if (etcdPchan != null && candidatePchannel.equals(etcdPchan)) {
+                continue;  // Already tried via etcd
             }
             if (tryOpenStream(candidatePchannel, policy)) {
                 log.info("Auto-detected correct pchannel: {} for collectionId={}",

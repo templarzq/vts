@@ -28,10 +28,14 @@ import org.apache.seatunnel.api.table.catalog.CatalogTable;
 import org.apache.seatunnel.api.table.catalog.TablePath;
 import org.apache.seatunnel.api.table.type.SeaTunnelRow;
 import org.apache.seatunnel.connectors.seatunnel.milvus.source.utils.MilvusSourceConnectorUtils;
+import org.apache.seatunnel.connectors.seatunnel.milvus.sink.utils.MilvusConnectorUtils;
 
 import com.google.auto.service.AutoService;
+import io.milvus.v2.client.MilvusClientV2;
+import lombok.extern.slf4j.Slf4j;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -44,6 +48,7 @@ import java.util.Map;
  * {@link MilvusCdcSourceFactory}, which handles checkpoint-based restore via
  * {@link MilvusCdcSourceState}.
  */
+@Slf4j
 @AutoService(SeaTunnelSource.class)
 public class MilvusCdcSource
         implements SeaTunnelSource<SeaTunnelRow, MilvusCdcSourceSplit, MilvusCdcSourceState>,
@@ -64,8 +69,48 @@ public class MilvusCdcSource
         this.config = config;
         this.cdcConfig = MilvusCdcSourceConfig.of(config);
         this.checkpointState = checkpointState;
-        MilvusSourceConnectorUtils utils = new MilvusSourceConnectorUtils(config);
-        this.sourceTables = utils.getTables();
+
+        // Build sourceTables. When collections=["*"], list all collections
+        // from Milvus and pass those names to the utility, because the utility
+        // treats "*" as a literal collection name.
+        if (cdcConfig.isSyncAllCollections()) {
+            this.sourceTables = discoverAllCollections();
+        } else {
+            MilvusSourceConnectorUtils utils = new MilvusSourceConnectorUtils(config);
+            this.sourceTables = utils.getTables();
+        }
+    }
+
+    private Map<TablePath, CatalogTable> discoverAllCollections() {
+        Map<TablePath, CatalogTable> tables = new HashMap<>();
+        try (MilvusClientV2 client = new MilvusClientV2(
+                MilvusConnectorUtils.getConnectConfig(config))) {
+            List<String> allCollections = client.listCollections().getCollectionNames();
+            log.info("Wildcard sync: discovered {} collections", allCollections.size());
+
+            // Build a config with the actual collection list for each collection
+            // so the utility doesn't try to describe collection named "*"
+            for (String col : allCollections) {
+                try {
+                    Map<String, Object> colConfig = new HashMap<>();
+                    colConfig.put("url", config.get(
+                            org.apache.seatunnel.connectors.seatunnel.milvus.source.config.MilvusSourceConfig.URL));
+                    colConfig.put("token", config.get(
+                            org.apache.seatunnel.connectors.seatunnel.milvus.source.config.MilvusSourceConfig.TOKEN));
+                    colConfig.put("database", cdcConfig.getDatabase());
+                    colConfig.put("collections", java.util.Collections.singletonList(col));
+                    MilvusSourceConnectorUtils utils =
+                            new MilvusSourceConnectorUtils(ReadonlyConfig.fromMap(colConfig));
+                    Map<TablePath, CatalogTable> result = utils.getTables();
+                    tables.putAll(result);
+                } catch (Exception e) {
+                    log.warn("Failed to discover collection '{}': {}", col, e.getMessage());
+                }
+            }
+        } catch (Exception e) {
+            log.error("Failed to discover all collections: {}", e.getMessage());
+        }
+        return tables;
     }
 
     @Override
@@ -75,7 +120,16 @@ public class MilvusCdcSource
 
     @Override
     public List<CatalogTable> getProducedCatalogTables() {
-        return new ArrayList<>(sourceTables.values());
+        // Produce catalog tables for all collections that should be synced.
+        // When no specific collection is configured, sync all discovered collections.
+        List<CatalogTable> result = new ArrayList<>();
+        for (Map.Entry<TablePath, CatalogTable> entry : sourceTables.entrySet()) {
+            String tableName = entry.getValue().getTableId().getTableName();
+            if (cdcConfig.shouldSyncCollection(tableName)) {
+                result.add(entry.getValue());
+            }
+        }
+        return result;
     }
 
     @Override

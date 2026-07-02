@@ -233,6 +233,13 @@ public class MilvusCdcSourceSplitEnumerator
             CatalogTable table = entry.getValue();
             String collectionName = table.getTableId().getTableName();
 
+            // Filter collections: sync all, specific list, or a single collection
+            if (!cdcConfig.shouldSyncCollection(collectionName)) {
+                log.info("Skipping snapshot for collection '{}' — not in configured collections",
+                        collectionName);
+                continue;
+            }
+
             DescribeCollectionResp desc = client.describeCollection(
                     DescribeCollectionReq.builder().collectionName(collectionName).build());
 
@@ -340,19 +347,41 @@ public class MilvusCdcSourceSplitEnumerator
         if (readerCount == 0) readerCount = 1;
 
         long startId = getMaxSeenId();
-        for (int readerId : context.registeredReaders()) {
-            String splitId = "cdc-inc-" + readerId;
-            ReplicatePosition startPos = splitPositions.get(splitId);
 
-            MilvusCdcSourceSplit incSplit = MilvusCdcSourceSplit.builder()
-                    .splitId(splitId)
-                    .collectionName(cdcConfig.getCollection())
-                    .snapshot(false)
-                    .startId(startId)
-                    .endId(Long.MAX_VALUE)
-                    .startPosition(startPos)
-                    .build();
-            addPendingSplit(Collections.singletonList(incSplit));
+        // Get all collections that should be synced
+        List<String> syncedCollections = new ArrayList<>();
+        for (Map.Entry<TablePath, CatalogTable> entry : tables.entrySet()) {
+            String colName = entry.getValue().getTableId().getTableName();
+            if (cdcConfig.shouldSyncCollection(colName)) {
+                syncedCollections.add(colName);
+            }
+        }
+
+        // If no matching collections, use the effective single collection
+        if (syncedCollections.isEmpty()) {
+            String effectiveCol = cdcConfig.getEffectiveCollection();
+            if (effectiveCol != null) {
+                syncedCollections.add(effectiveCol);
+            }
+        }
+
+        // Generate one incremental split per reader per collection
+        int idx = 0;
+        for (String collectionName : syncedCollections) {
+            for (int readerId : context.registeredReaders()) {
+                String splitId = "cdc-inc-" + collectionName + "-" + idx++;
+                ReplicatePosition startPos = splitPositions.get(splitId);
+
+                MilvusCdcSourceSplit incSplit = MilvusCdcSourceSplit.builder()
+                        .splitId(splitId)
+                        .collectionName(collectionName)
+                        .snapshot(false)
+                        .startId(startId)
+                        .endId(Long.MAX_VALUE)
+                        .startPosition(startPos)
+                        .build();
+                addPendingSplit(Collections.singletonList(incSplit));
+            }
         }
     }
 

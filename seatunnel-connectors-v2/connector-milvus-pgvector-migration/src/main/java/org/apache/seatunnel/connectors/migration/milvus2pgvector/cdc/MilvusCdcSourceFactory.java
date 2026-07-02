@@ -49,9 +49,10 @@ public class MilvusCdcSourceFactory implements ChangeStreamTableSourceFactory {
         return OptionRule.builder()
                 .required(
                         MilvusCdcSourceConfig.URL,
-                        MilvusCdcSourceConfig.TOKEN,
-                        MilvusCdcSourceConfig.COLLECTION)
+                        MilvusCdcSourceConfig.TOKEN)
                 .optional(
+                        MilvusCdcSourceConfig.COLLECTION,
+                        MilvusCdcSourceConfig.COLLECTIONS,
                         MilvusCdcSourceConfig.DATABASE,
                         MilvusCdcSourceConfig.BATCH_SIZE,
                         MilvusCdcSourceConfig.INCREMENTAL_BATCH_SIZE,
@@ -67,8 +68,11 @@ public class MilvusCdcSourceFactory implements ChangeStreamTableSourceFactory {
                         MilvusCdcSourceConfig.SERVER_NAME,
                         MilvusCdcSourceConfig.PARALLELISM,
                         MilvusCdcSourceConfig.CDC_PCHANNEL,
+                        MilvusCdcSourceConfig.CDC_ETCD_ENDPOINT,
                         MilvusCdcSourceConfig.CDC_SOURCE_CLUSTER_ID,
-                        MilvusCdcSourceConfig.CDC_START_MESSAGE_ID)
+                        MilvusCdcSourceConfig.CDC_START_MESSAGE_ID,
+                        MilvusCdcSourceConfig.STREAMING_NODE_ADDRESS,
+                        MilvusCdcSourceConfig.CDC_USE_STREAMING_NODE)
                 .build();
     }
 

@@ -60,7 +60,15 @@ public class MilvusCdcSourceConfig implements Serializable {
             Options.key("collection")
                     .stringType()
                     .noDefaultValue()
-                    .withDescription("Collection name to capture changes from");
+                    .withDescription("Collection name to capture changes from. "
+                            + "If omitted when collections is also omitted, syncs all collections.");
+
+    public static final Option<java.util.List<String>> COLLECTIONS =
+            Options.key("collections")
+                    .listType()
+                    .noDefaultValue()
+                    .withDescription("Collection names to capture changes from. "
+                            + "Use [\"*\"] to sync all collections in the database.");
 
     public static final Option<Integer> BATCH_SIZE =
             Options.key("batch_size")
@@ -185,6 +193,15 @@ public class MilvusCdcSourceConfig implements Serializable {
      * event_stream CDC stream. Optional; if blank the {@code source_cluster_id}
      * field is omitted from the request and the server uses its default.
      */
+    public static final Option<String> CDC_ETCD_ENDPOINT =
+            Options.key("cdc_etcd_endpoint")
+                    .stringType()
+                    .defaultValue("http://localhost:2379")
+                    .withDescription(
+                            "etcd endpoint for pchannel auto-discovery. "
+                                    + "Used by event_stream strategy to find the correct "
+                                    + "pchannel for a collection from etcd channel-cp data.");
+
     public static final Option<String> CDC_SOURCE_CLUSTER_ID =
             Options.key("cdc_source_cluster_id")
                     .stringType()
@@ -212,6 +229,8 @@ public class MilvusCdcSourceConfig implements Serializable {
     private String token;
     private String database;
     private String collection;
+    @Builder.Default
+    private java.util.List<String> collections = null;
     private Integer batchSize;
     private Long incrementalBatchSize;
     private Long pollIntervalMs;
@@ -226,6 +245,7 @@ public class MilvusCdcSourceConfig implements Serializable {
     private String serverName;
     private Integer parallelism;
     private String cdcPchannel;
+    private String cdcEtcdEndpoint;
     private String cdcSourceClusterId;
     private String cdcStartMessageId;
     private String streamingNodeAddress;
@@ -251,10 +271,54 @@ public class MilvusCdcSourceConfig implements Serializable {
                 .serverName(config.get(SERVER_NAME))
                 .parallelism(config.get(PARALLELISM))
                 .cdcPchannel(config.get(CDC_PCHANNEL))
+                .cdcEtcdEndpoint(config.get(CDC_ETCD_ENDPOINT))
                 .cdcSourceClusterId(config.get(CDC_SOURCE_CLUSTER_ID))
                 .cdcStartMessageId(config.get(CDC_START_MESSAGE_ID))
                 .streamingNodeAddress(config.get(STREAMING_NODE_ADDRESS))
                 .cdcUseStreamingNode(config.get(CDC_USE_STREAMING_NODE))
+                .collections(config.get(COLLECTIONS))
                 .build();
+    }
+
+    /**
+     * Whether to sync all collections (collections=["*"]).
+     */
+    public boolean isSyncAllCollections() {
+        return collections != null && !collections.isEmpty()
+                && "*".equals(collections.get(0));
+    }
+
+    /**
+     * Check whether a given collection should be synced.
+     *
+     * @param collectionName the collection to check
+     * @return true if this collection should be included in sync
+     */
+    public boolean shouldSyncCollection(String collectionName) {
+        if (collection != null && !collection.isEmpty()) {
+            return collection.equals(collectionName);
+        }
+        if (collections != null && !collections.isEmpty()) {
+            if (isSyncAllCollections()) {
+                return true;
+            }
+            return collections.contains(collectionName);
+        }
+        // No collection filter configured → sync all
+        return true;
+    }
+
+    /**
+     * Get the effective target collection name for single-collection mode.
+     * Returns null when operating in multi-collection mode.
+     */
+    public String getEffectiveCollection() {
+        if (collection != null && !collection.isEmpty()) {
+            return collection;
+        }
+        if (collections != null && !collections.isEmpty() && !isSyncAllCollections()) {
+            return collections.get(0);
+        }
+        return null;
     }
 }
