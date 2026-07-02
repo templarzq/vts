@@ -252,16 +252,13 @@ public class MilvusCdcSourceReader implements SourceReader<SeaTunnelRow, MilvusC
         String strategyType = cdcConfig.getCdcStrategy();
 
         if ("event_stream".equalsIgnoreCase(strategyType)) {
-            if (cdcConfig.getCdcPchannel() == null || cdcConfig.getCdcPchannel().isEmpty()) {
-                log.error("cdc_strategy=event_stream requires cdc_pchannel to be set; "
-                        + "falling back to polling_incremental strategy");
-            } else if (Boolean.TRUE.equals(cdcConfig.getCdcUseStreamingNode())) {
-                // New strategy V2: StreamingNode gRPC (works in standalone mode)
+            if (Boolean.TRUE.equals(cdcConfig.getCdcUseStreamingNode())) {
+                // V2 strategy: StreamingNode gRPC (works in standalone mode).
+                // cdc_pchannel is optional — auto-discovery from etcd + 0-15 scan.
                 CdcEventStreamStrategyV2 v2Strategy = new CdcEventStreamStrategyV2(
                         cdcConfig, collectionDesc);
                 if (v2Strategy.isAvailable()) {
-                    log.info("Using event_stream V2 CDC strategy via StreamingNode gRPC (pchannel={})",
-                            cdcConfig.getCdcPchannel());
+                    log.info("Using event_stream V2 CDC strategy via StreamingNode gRPC");
                     return v2Strategy;
                 }
                 log.warn("event_stream V2 (StreamingNode) not available; "
@@ -272,6 +269,10 @@ public class MilvusCdcSourceReader implements SourceReader<SeaTunnelRow, MilvusC
                     log.debug("Error closing unavailable event_stream V2 strategy", e);
                 }
                 // Fall through to legacy event_stream
+            } else if (cdcConfig.getCdcPchannel() == null
+                    || cdcConfig.getCdcPchannel().isEmpty()) {
+                log.error("cdc_strategy=event_stream (legacy) requires cdc_pchannel to be set; "
+                        + "falling back to polling_incremental strategy");
             } else {
                 // Legacy strategy: DumpMessages API (requires replication topology)
                 CdcEventStreamStrategy streamStrategy =

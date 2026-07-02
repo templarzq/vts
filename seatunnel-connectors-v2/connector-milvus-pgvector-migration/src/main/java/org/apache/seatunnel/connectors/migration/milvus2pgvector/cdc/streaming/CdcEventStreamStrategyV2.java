@@ -66,7 +66,8 @@ public class CdcEventStreamStrategyV2 implements CdcStrategy {
 
     private final StreamingNodeHandlerClient streamingNodeClient;
     private final StreamingMessageParser parser;
-    private final String pchannelName;
+    /** Configured pchannel — may be updated by auto-discovery in {@link #isAvailable()}. */
+    private String pchannelName;
     private final String vchannelName;
     private final long collectionId;
     private final long maxEventsPerPoll;
@@ -85,7 +86,11 @@ public class CdcEventStreamStrategyV2 implements CdcStrategy {
     /**
      * Public constructor — creates its own {@link StreamingNodeHandlerClient}.
      *
-     * @param config         CDC source config (must have {@code cdc_pchannel} set)
+     * <p>The {@code cdc_pchannel} config is optional — when omitted (null), pchannel
+     * auto-discovery from etcd and 0-15 scanning is performed in {@link #isAvailable()}
+     * and {@link #openStream}.
+     *
+     * @param config         CDC source config
      * @param collectionDesc collection schema description
      */
     public CdcEventStreamStrategyV2(
@@ -94,7 +99,10 @@ public class CdcEventStreamStrategyV2 implements CdcStrategy {
         this.collectionId = collectionDesc.getCollectionID();
         // vchannel format: {pchannel}_{collectionID}v{shardIdx}
         // For single-shard collections, shardIdx = 0
-        this.vchannelName = pchannelName + "_" + collectionId + "v0";
+        // Skip pre-computing vchannel when pchannel is not yet resolved
+        this.vchannelName = pchannelName != null && !pchannelName.isEmpty()
+                ? pchannelName + "_" + collectionId + "v0"
+                : null;
         this.maxEventsPerPoll = config.getIncrementalBatchSize();
         this.sourceClusterId = config.getCdcSourceClusterId();
 
@@ -119,40 +127,46 @@ public class CdcEventStreamStrategyV2 implements CdcStrategy {
     }
 
     /**
-     * Check if StreamingNode gRPC is available and the configured pchannel is valid.
+     * Check if StreamingNode gRPC is available and the pchannel is valid.
      *
-     * <p>Two-step probe:
+     * <p>Discovery order:
+     * <ol>
+     *   <li>If {@code cdc_pchannel} is configured, try it first; otherwise skip to step 2.</li>
+     *   <li>Query etcd for the channel-cp key matching this collection.</li>
+     *   <li>Scan pchannels 0-15 to auto-detect the correct one.</li>
+     * </ol>
+     *
+     * <p>Two-step probe per candidate pchannel:
      * <ol>
      *   <li>Call {@code GetReplicateCheckpoint} to verify the StreamingNode service is
      *       reachable. UNIMPLEMENTED (wrong port) or UNAVAILABLE (connection refused)
      *       → return false immediately.</li>
-     *   <li>If the service is reachable, try opening a Consume stream with term=1.
-     *       In standalone Milvus, term is always 1 (no channel rebalancing).
-     *       A valid pchannel will succeed; an invalid pchannel name will fail.</li>
+     *   <li>If the service is reachable, try opening a Consume stream.</li>
      * </ol>
      *
-     * @return true if StreamingNode service is reachable AND the pchannel is valid
+     * @return true if StreamingNode service is reachable AND a valid pchannel is found
      */
     @Override
     public boolean isAvailable() {
-        if (pchannelName == null || pchannelName.isEmpty()) {
-            log.warn("event_stream V2 isAvailable()=false: cdc_pchannel is not configured");
-            return false;
-        }
 
         // Step 1: Verify StreamingNode service is reachable via GetReplicateCheckpoint.
         // FAILED_PRECONDITION is expected in standalone mode (replication not enabled),
         // but the service is still reachable. UNIMPLEMENTED/UNAVAILABLE means the service
         // is not reachable at all.
+        // When pchannelName is not configured, use a standard fallback for the health probe.
+        String healthPchan = (pchannelName != null && !pchannelName.isEmpty())
+                ? pchannelName
+                : "by-dev-rootcoord-dml_0";
+        boolean hasConfiguredPchan = pchannelName != null && !pchannelName.isEmpty();
         try {
             PChannelInfo pchannel = PChannelInfo.newBuilder()
-                    .setName(pchannelName)
+                    .setName(healthPchan)
                     .setTerm(1)
                     .build();
 
             streamingNodeClient.getReplicateCheckpoint(pchannel);
             log.info("StreamingNode service reachable for pchannel={} (checkpoint RPC succeeded)",
-                    pchannelName);
+                    healthPchan);
         } catch (io.grpc.StatusRuntimeException e) {
             io.grpc.Status.Code code = e.getStatus().getCode();
             if (code == io.grpc.Status.Code.FAILED_PRECONDITION) {
@@ -168,41 +182,42 @@ public class CdcEventStreamStrategyV2 implements CdcStrategy {
         }
 
         // Step 2: Validate the pchannel.
-        // Try configured pchannel → etcd-resolved → auto-discovery (0-15).
+        // Priority: etcd-resolved → configured → auto-discovery (0-15).
+        // etcd is the authoritative source for collection→pchannel mapping.
+        // A physically valid pchannel may not contain this collection's data,
+        // so we MUST prefer the etcd-resolved pchannel over the configured one.
         String resolvedPchan = resolvePchannelFromEtcd();
 
-        // Try configured pchannel first
-        if (probeConsumeStream(pchannelName)) {
-            log.info("StreamingNode gRPC available for configured pchannel={}", pchannelName);
-            return true;
-        }
-
-        // Try etcd-resolved pchannel
-        if (resolvedPchan != null && !resolvedPchan.equals(pchannelName)) {
+        // Try etcd-resolved pchannel first (authoritative mapping)
+        if (resolvedPchan != null) {
             if (probeConsumeStream(resolvedPchan)) {
                 log.info("StreamingNode gRPC available for etcd-resolved pchannel={}", resolvedPchan);
+                this.pchannelName = resolvedPchan;
                 return true;
             }
         }
 
-        // Auto-discover: try pchannels 0-15 — only when the configured pchannel
-        // follows the standard naming convention (contains "-rootcoord-dml_"),
-        // indicating the root path is known. If the pchannel is completely invalid
-        // (e.g., "invalid-pchannel-name"), skip auto-discovery to allow the
-        // caller to detect the misconfiguration.
-        if (pchannelName != null && pchannelName.contains("-rootcoord-dml_")) {
-            log.info("Configured and etcd pchannels failed; auto-discovering for collectionId={}",
-                    collectionId);
-            String prefix = extractRootPathFromPchannel();
-            for (int i = 0; i < 16; i++) {
-                String candidate = prefix + "-rootcoord-dml_" + i;
-                if (candidate.equals(pchannelName)) continue;
-                if (resolvedPchan != null && candidate.equals(resolvedPchan)) continue;
-                if (probeConsumeStream(candidate)) {
-                    log.info("Auto-discovered correct pchannel: {} for collectionId={}",
-                            candidate, collectionId);
-                    return true;
-                }
+        // Try configured pchannel as fallback
+        if (hasConfiguredPchan && !pchannelName.equals(resolvedPchan)) {
+            if (probeConsumeStream(pchannelName)) {
+                log.info("StreamingNode gRPC available for configured pchannel={}", pchannelName);
+                return true;
+            }
+        }
+
+        // Auto-discover: try pchannels 0-15
+        log.info("etcd and configured pchannel failed; auto-discovering for collectionId={}",
+                collectionId);
+        String prefix = extractRootPathFromPchannel();
+        for (int i = 0; i < 16; i++) {
+            String candidate = prefix + "-rootcoord-dml_" + i;
+            if (candidate.equals(resolvedPchan)) continue;
+            if (hasConfiguredPchan && candidate.equals(pchannelName)) continue;
+            if (probeConsumeStream(candidate)) {
+                log.info("Auto-discovered correct pchannel: {} for collectionId={}",
+                        candidate, collectionId);
+                this.pchannelName = candidate;
+                return true;
             }
         }
 
@@ -517,14 +532,14 @@ public class CdcEventStreamStrategyV2 implements CdcStrategy {
             log.info("Opening Consume stream for full snapshot: DeliverPolicy.all");
         }
 
-        // Step 1: Try the configured pchannel
-        if (tryOpenStream(pchannelName, policy)) {
-            return;
-        }
+        boolean hasConfiguredPchan = pchannelName != null && !pchannelName.isEmpty();
 
-        // Step 2: Try the etcd-resolved pchannel for this collection
+        // Priority: etcd-resolved → cached/configured → auto-discovery (0-15).
+        // etcd is the authoritative source for collection→pchannel mapping.
+
+        // Step 1: Try etcd-resolved pchannel first (authoritative mapping)
         String etcdPchan = resolvePchannelFromEtcd();
-        if (etcdPchan != null && !etcdPchan.equals(pchannelName)) {
+        if (etcdPchan != null) {
             log.info("Trying etcd-resolved pchannel: {} for collectionId={}", etcdPchan, collectionId);
             if (tryOpenStream(etcdPchan, policy)) {
                 log.info("Successfully opened stream on etcd-resolved pchannel: {}", etcdPchan);
@@ -532,17 +547,21 @@ public class CdcEventStreamStrategyV2 implements CdcStrategy {
             }
         }
 
+        // Step 2: Try the configured or cached pchannel as fallback
+        if (hasConfiguredPchan && !pchannelName.equals(etcdPchan)) {
+            if (tryOpenStream(pchannelName, policy)) {
+                return;
+            }
+        }
+
         // Step 3: Auto-detect: try all pchannels (0-15)
-        log.info("Configured and etcd pchannels failed; auto-detecting for collectionId={}",
-                collectionId);
+        String prefix = extractRootPathFromPchannel();
+        log.info("etcd and configured pchannel failed; auto-detecting for collectionId={} (prefix={})",
+                collectionId, prefix);
         for (int i = 0; i < 16; i++) {
-            String candidatePchannel = "by-dev-rootcoord-dml_" + i;
-            if (candidatePchannel.equals(pchannelName)) {
-                continue;  // Already tried
-            }
-            if (etcdPchan != null && candidatePchannel.equals(etcdPchan)) {
-                continue;  // Already tried via etcd
-            }
+            String candidatePchannel = prefix + "-rootcoord-dml_" + i;
+            if (candidatePchannel.equals(etcdPchan)) continue;
+            if (hasConfiguredPchan && candidatePchannel.equals(pchannelName)) continue;
             if (tryOpenStream(candidatePchannel, policy)) {
                 log.info("Auto-detected correct pchannel: {} for collectionId={}",
                         candidatePchannel, collectionId);

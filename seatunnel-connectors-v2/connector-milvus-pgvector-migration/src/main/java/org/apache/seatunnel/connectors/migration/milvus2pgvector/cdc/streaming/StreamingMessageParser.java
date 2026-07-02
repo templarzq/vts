@@ -337,11 +337,14 @@ public class StreamingMessageParser {
             if (vectors.hasFloatVector()) {
                 int dim = (int) vectors.getDim();
                 int offset = (int) (rowIdx * dim);
-                List<Float> vec = new ArrayList<>(dim);
+                // SeaTunnel framework expects vectors as ByteBuffer (not List)
+                java.nio.ByteBuffer buf = java.nio.ByteBuffer.allocate(dim * Float.BYTES);
+                buf.order(java.nio.ByteOrder.LITTLE_ENDIAN);
                 for (int i = 0; i < dim; i++) {
-                    vec.add(vectors.getFloatVector().getData(offset + i));
+                    buf.putFloat(vectors.getFloatVector().getData(offset + i));
                 }
-                return vec;
+                buf.rewind();
+                return buf;
             }
         }
         return null;
