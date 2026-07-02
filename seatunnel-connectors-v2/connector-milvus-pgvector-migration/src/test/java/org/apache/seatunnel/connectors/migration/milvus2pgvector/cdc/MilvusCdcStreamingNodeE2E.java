@@ -122,6 +122,7 @@ public class MilvusCdcStreamingNodeE2E extends MilvusCdcE2ETestBase {
                 .cdcStrategy("event_stream")
                 .cdcUseStreamingNode(true)
                 .cdcPchannel(actualPchannel != null ? actualPchannel : PCHANNEL)
+                .cdcEtcdEndpoint("http://localhost:2379")
                 .streamingNodeAddress(STREAMING_NODE_ADDR)
                 .incrementalBatchSize(batchSize)
                 .pollIntervalMs(500L)
@@ -189,7 +190,7 @@ public class MilvusCdcStreamingNodeE2E extends MilvusCdcE2ETestBase {
             CdcEventStreamStrategyV2 strategy, String collectionName,
             long timeoutMs, ReplicatePosition startPosition)
             throws Exception {
-        return pollForEvents(strategy, collectionName, timeoutMs, startPosition, 1);
+        return pollForEvents(strategy, collectionName, timeoutMs, startPosition, 10);
     }
 
     /**
