@@ -29,6 +29,8 @@ import org.apache.seatunnel.api.table.catalog.TablePath;
 import org.apache.seatunnel.api.table.type.SeaTunnelRow;
 import org.apache.seatunnel.connectors.seatunnel.milvus.source.utils.MilvusSourceConnectorUtils;
 
+import com.google.auto.service.AutoService;
+
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -42,6 +44,7 @@ import java.util.Map;
  * {@link MilvusCdcSourceFactory}, which handles checkpoint-based restore via
  * {@link MilvusCdcSourceState}.
  */
+@AutoService(SeaTunnelSource.class)
 public class MilvusCdcSource
         implements SeaTunnelSource<SeaTunnelRow, MilvusCdcSourceSplit, MilvusCdcSourceState>,
                 SupportParallelism,
