@@ -26,7 +26,6 @@ import org.apache.seatunnel.connectors.migration.milvus2pgvector.cdc.SeaTunnelRo
 import org.apache.seatunnel.connectors.streaming.proto.DeliverPolicy;
 import org.apache.seatunnel.connectors.streaming.proto.ImmutableMessage;
 import org.apache.seatunnel.connectors.streaming.proto.MessageID;
-import org.apache.seatunnel.connectors.streaming.proto.PChannelAccessMode;
 import org.apache.seatunnel.connectors.streaming.proto.PChannelInfo;
 import org.apache.seatunnel.connectors.streaming.proto.ReplicateCheckpoint;
 
@@ -149,7 +148,6 @@ public class CdcEventStreamStrategyV2 implements CdcStrategy {
             PChannelInfo pchannel = PChannelInfo.newBuilder()
                     .setName(pchannelName)
                     .setTerm(1)
-                    .setAccessMode(PChannelAccessMode.PCHANNEL_ACCESS_READONLY)
                     .build();
 
             streamingNodeClient.getReplicateCheckpoint(pchannel);
@@ -170,25 +168,48 @@ public class CdcEventStreamStrategyV2 implements CdcStrategy {
         }
 
         // Step 2: Validate the pchannel.
-        // Try the configured pchannel first, then auto-discover from etcd.
+        // Try configured pchannel → etcd-resolved → auto-discovery (0-15).
         String resolvedPchan = resolvePchannelFromEtcd();
-        String channelToProbe = resolvedPchan != null ? resolvedPchan : pchannelName;
 
-        boolean pchannelValid = probeConsumeStream(channelToProbe);
-        if (pchannelValid) {
-            log.info("StreamingNode gRPC available for pchannel={} (Consume probe succeeded)",
-                    channelToProbe);
-        } else if (resolvedPchan == null) {
-            log.warn("StreamingNode gRPC service reachable but pchannel={} is invalid "
-                    + "(Consume probe failed for term=1). "
-                    + "No etcd mapping found for collectionId={} either.",
-                    pchannelName, collectionId);
-        } else {
-            log.warn("StreamingNode gRPC service reachable but both configured pchannel={} "
-                    + "and etcd-resolved pchannel={} are invalid",
-                    pchannelName, resolvedPchan);
+        // Try configured pchannel first
+        if (probeConsumeStream(pchannelName)) {
+            log.info("StreamingNode gRPC available for configured pchannel={}", pchannelName);
+            return true;
         }
-        return pchannelValid;
+
+        // Try etcd-resolved pchannel
+        if (resolvedPchan != null && !resolvedPchan.equals(pchannelName)) {
+            if (probeConsumeStream(resolvedPchan)) {
+                log.info("StreamingNode gRPC available for etcd-resolved pchannel={}", resolvedPchan);
+                return true;
+            }
+        }
+
+        // Auto-discover: try pchannels 0-15 — only when the configured pchannel
+        // follows the standard naming convention (contains "-rootcoord-dml_"),
+        // indicating the root path is known. If the pchannel is completely invalid
+        // (e.g., "invalid-pchannel-name"), skip auto-discovery to allow the
+        // caller to detect the misconfiguration.
+        if (pchannelName != null && pchannelName.contains("-rootcoord-dml_")) {
+            log.info("Configured and etcd pchannels failed; auto-discovering for collectionId={}",
+                    collectionId);
+            String prefix = extractRootPathFromPchannel();
+            for (int i = 0; i < 16; i++) {
+                String candidate = prefix + "-rootcoord-dml_" + i;
+                if (candidate.equals(pchannelName)) continue;
+                if (resolvedPchan != null && candidate.equals(resolvedPchan)) continue;
+                if (probeConsumeStream(candidate)) {
+                    log.info("Auto-discovered correct pchannel: {} for collectionId={}",
+                            candidate, collectionId);
+                    return true;
+                }
+            }
+        }
+
+        log.warn("StreamingNode gRPC service reachable but no valid pchannel found "
+                + "for collectionId={} (tried configured={}, etcd={}, and 0-15)",
+                collectionId, pchannelName, resolvedPchan);
+        return false;
     }
 
     /**
@@ -255,7 +276,6 @@ public class CdcEventStreamStrategyV2 implements CdcStrategy {
             PChannelInfo pchannelInfo = PChannelInfo.newBuilder()
                     .setName(pchannel)
                     .setTerm(term)
-                    .setAccessMode(PChannelAccessMode.PCHANNEL_ACCESS_READONLY)
                     .build();
 
             ConsumeStream stream = streamingNodeClient.createConsumeStream(
@@ -344,6 +364,16 @@ public class CdcEventStreamStrategyV2 implements CdcStrategy {
             return pchannel.substring(0, pchannel.indexOf("-rootcoord-dml_"));
         }
         // Default root path for Milvus
+        return "by-dev";
+    }
+
+    /**
+     * Extract the root path from the configured pchannel name, falling back to "by-dev".
+     */
+    private String extractRootPathFromPchannel() {
+        if (pchannelName != null && pchannelName.contains("-rootcoord-dml_")) {
+            return pchannelName.substring(0, pchannelName.indexOf("-rootcoord-dml_"));
+        }
         return "by-dev";
     }
 

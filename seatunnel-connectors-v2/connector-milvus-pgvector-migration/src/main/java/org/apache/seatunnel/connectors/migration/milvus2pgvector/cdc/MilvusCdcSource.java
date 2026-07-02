@@ -28,10 +28,8 @@ import org.apache.seatunnel.api.table.catalog.CatalogTable;
 import org.apache.seatunnel.api.table.catalog.TablePath;
 import org.apache.seatunnel.api.table.type.SeaTunnelRow;
 import org.apache.seatunnel.connectors.seatunnel.milvus.source.utils.MilvusSourceConnectorUtils;
-import org.apache.seatunnel.connectors.seatunnel.milvus.sink.utils.MilvusConnectorUtils;
 
 import com.google.auto.service.AutoService;
-import io.milvus.v2.client.MilvusClientV2;
 import lombok.extern.slf4j.Slf4j;
 
 import java.util.ArrayList;
@@ -82,35 +80,17 @@ public class MilvusCdcSource
     }
 
     private Map<TablePath, CatalogTable> discoverAllCollections() {
-        Map<TablePath, CatalogTable> tables = new HashMap<>();
-        try (MilvusClientV2 client = new MilvusClientV2(
-                MilvusConnectorUtils.getConnectConfig(config))) {
-            List<String> allCollections = client.listCollections().getCollectionNames();
-            log.info("Wildcard sync: discovered {} collections", allCollections.size());
-
-            // Build a config with the actual collection list for each collection
-            // so the utility doesn't try to describe collection named "*"
-            for (String col : allCollections) {
-                try {
-                    Map<String, Object> colConfig = new HashMap<>();
-                    colConfig.put("url", config.get(
-                            org.apache.seatunnel.connectors.seatunnel.milvus.source.config.MilvusSourceConfig.URL));
-                    colConfig.put("token", config.get(
-                            org.apache.seatunnel.connectors.seatunnel.milvus.source.config.MilvusSourceConfig.TOKEN));
-                    colConfig.put("database", cdcConfig.getDatabase());
-                    colConfig.put("collections", java.util.Collections.singletonList(col));
-                    MilvusSourceConnectorUtils utils =
-                            new MilvusSourceConnectorUtils(ReadonlyConfig.fromMap(colConfig));
-                    Map<TablePath, CatalogTable> result = utils.getTables();
-                    tables.putAll(result);
-                } catch (Exception e) {
-                    log.warn("Failed to discover collection '{}': {}", col, e.getMessage());
-                }
-            }
-        } catch (Exception e) {
-            log.error("Failed to discover all collections: {}", e.getMessage());
-        }
-        return tables;
+        // Remove "collections" key from config so MilvusSourceConnectorUtils
+        // falls into its "list all collections" branch (empty list check).
+        // The "*" wildcard otherwise causes it to describe collection named "*".
+        Map<String, Object> configMap = new HashMap<>();
+        config.toMap().forEach((k, v) -> configMap.put(k, v));
+        configMap.remove("collections");
+        ReadonlyConfig cleanedConfig = ReadonlyConfig.fromMap(configMap);
+        MilvusSourceConnectorUtils utils = new MilvusSourceConnectorUtils(cleanedConfig);
+        Map<TablePath, CatalogTable> allTables = utils.getTables();
+        log.info("Wildcard sync: discovered {} collections", allTables.size());
+        return allTables;
     }
 
     @Override

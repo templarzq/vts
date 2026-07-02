@@ -41,7 +41,6 @@ import lombok.extern.slf4j.Slf4j;
 
 import java.net.URI;
 import java.net.URISyntaxException;
-import java.util.Base64;
 import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 
@@ -56,6 +55,7 @@ public class StreamingNodeHandlerClient implements AutoCloseable {
 
     private static final String AUTHORIZATION_HEADER = "authorization";
     private static final String BEARER_PREFIX = "Bearer ";
+    private static final String CREATE_CONSUMER_HEADER = "create-consumer";
 
     private final ManagedChannel channel;
     private final StreamingNodeHandlerServiceGrpc.StreamingNodeHandlerServiceStub asyncStub;
@@ -183,24 +183,30 @@ public class StreamingNodeHandlerClient implements AutoCloseable {
         log.info("Creating ConsumeStream for pchannel={}, vchannel={}, policy={}",
                 pchannel.getName(), vchannel, policy.getPolicyCase());
 
-        // 1. Build CreateConsumerRequest for gRPC metadata
+        // 1. Build CreateConsumerRequest for gRPC metadata header.
+        // Milvus StreamingNode uses a CUSTOM base64 encoding scheme for the
+        // "create-consumer" metadata header (NOT the gRPC-standard "-bin" suffix).
+        // The server manually base64-decodes the value using:
+        //   md.Get("create-consumer") → base64.StdEncoding.DecodeString → proto.Unmarshal
         CreateConsumerRequest createConsumerReq = CreateConsumerRequest.newBuilder()
                 .setPchannel(pchannel)
                 .build();
-        byte[] createConsumerBytes = createConsumerReq.toByteArray();
-        String createConsumerBase64 = Base64.getEncoder().encodeToString(createConsumerBytes);
+        String base64Value = java.util.Base64.getEncoder()
+                .encodeToString(createConsumerReq.toByteArray());
 
-        // 2. Create gRPC metadata with create-consumer header
+        // 2. Create gRPC metadata with manually base64-encoded protobuf value.
+        // Use ASCII_STRING_MARSHALLER (not BINARY_BYTE_MARSHALLER) because
+        // the server expects a plain-text base64 string, not binary bytes.
         Metadata metadata = new Metadata();
         Metadata.Key<String> createConsumerKey =
-                Metadata.Key.of("create-consumer", Metadata.ASCII_STRING_MARSHALLER);
-        metadata.put(createConsumerKey, createConsumerBase64);
+                Metadata.Key.of(CREATE_CONSUMER_HEADER, Metadata.ASCII_STRING_MARSHALLER);
+        metadata.put(createConsumerKey, base64Value);
 
         // 3. Create async stub with metadata interceptor
         StreamingNodeHandlerServiceGrpc.StreamingNodeHandlerServiceStub stubWithMetadata =
                 asyncStub.withInterceptors(MetadataUtils.newAttachHeadersInterceptor(metadata));
 
-        // 4. Create VChannel consumer request (first stream message)
+        // 4. Create VChannel consumer request (first stream message).
         ConsumeRequest createRequest = ConsumeRequest.newBuilder()
                 .setCreateVchannelConsumer(CreateVChannelConsumerRequest.newBuilder()
                         .setVchannel(vchannel)

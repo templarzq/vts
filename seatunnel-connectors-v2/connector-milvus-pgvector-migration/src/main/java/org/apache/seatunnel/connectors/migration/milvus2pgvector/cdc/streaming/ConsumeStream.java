@@ -72,11 +72,21 @@ public class ConsumeStream implements Iterator<ImmutableMessage>, AutoCloseable 
     private volatile StreamingCode createVchannelErrorCode = null;
     private volatile String createVchannelErrorCause = null;
 
+    // Term extracted from stream-level FAILED_PRECONDITION error (gRPC trailers/description)
+    private volatile long streamLevelCurrentTerm = -1;
+
     // Pattern to extract the server's current term from UNMATCHED_CHANNEL_TERM error cause.
     // Milvus error format: "channel <name> at term <clientTerm> is expected, but current term is <serverTerm>"
     // The client must retry with <serverTerm> (the number after "current term is").
     private static final Pattern CURRENT_TERM_PATTERN =
             Pattern.compile("current term is (\\d+)", Pattern.CASE_INSENSITIVE);
+
+    // Pattern to extract term from gRPC status description or trailers
+    private static final Pattern TERM_PATTERN_DESC =
+            Pattern.compile("term[=: ]*(\\d+)", Pattern.CASE_INSENSITIVE);
+    private static final Pattern TERM_PATTERN_CHANNEL =
+            Pattern.compile("channel.*?at term (\\d+).*?expected.*?current term is (\\d+)",
+                    Pattern.CASE_INSENSITIVE);
 
     /**
      * Constructor: creates a bidirectional stream and sends initial CreateVChannelConsumerRequest.
@@ -121,6 +131,24 @@ public class ConsumeStream implements Iterator<ImmutableMessage>, AutoCloseable 
                         log.info("VChannel consumer created for pchannel={}, consumerId={}",
                                 pchannelName, vcResp.getConsumerId());
                     }
+                } else if (response.hasCreateVchannels()) {
+                    // Handle CreateVChannelConsumersResponse (plural form, field 4)
+                    java.util.List<CreateVChannelConsumerResponse> vcResps =
+                            response.getCreateVchannels().getCreateVchannelsList();
+                    for (int i = 0; i < vcResps.size(); i++) {
+                        CreateVChannelConsumerResponse vcResp = vcResps.get(i);
+                        if (vcResp.hasError()) {
+                            StreamingError err = vcResp.getError();
+                            createVchannelErrorCode = err.getCode();
+                            createVchannelErrorCause = err.getCause();
+                            log.warn("CreateVChannelConsumer[{}] failed for pchannel={}: code={}, cause={}",
+                                    i, pchannelName, createVchannelErrorCode, createVchannelErrorCause);
+                            isOpen = false;
+                        } else {
+                            log.info("VChannel consumer[{}] created for pchannel={}, consumerId={}",
+                                    i, pchannelName, vcResp.getConsumerId());
+                        }
+                    }
                 } else if (response.hasCloseVchannel()) {
                     log.info("VChannel consumer closed for pchannel={}, consumerId={}",
                             pchannelName, response.getCloseVchannel().getConsumerId());
@@ -134,14 +162,134 @@ public class ConsumeStream implements Iterator<ImmutableMessage>, AutoCloseable 
                 if (t instanceof StatusRuntimeException) {
                     Status status = ((StatusRuntimeException) t).getStatus();
                     grpcStatusCode = status.getCode();
-                    log.error("Consume stream error for pchannel={}: code={}, description={}, cause={}",
+                    // Try to extract StreamingError from grpc-status-details-bin trailer
+                    String streamingDetail = "";
+                    try {
+                        io.grpc.Metadata trailers = ((StatusRuntimeException) t).getTrailers();
+                        if (trailers != null) {
+                            byte[] statusDetailsBin = trailers.get(
+                                    io.grpc.Metadata.Key.of("grpc-status-details-bin",
+                                            io.grpc.Metadata.BINARY_BYTE_MARSHALLER));
+                            if (statusDetailsBin != null) {
+                                // Parse as google.rpc.Status to extract StreamingError detail
+                                com.google.rpc.Status rpcStatus = com.google.rpc.Status.parseFrom(statusDetailsBin);
+                                for (com.google.protobuf.Any detail : rpcStatus.getDetailsList()) {
+                                    if (detail.is(StreamingError.class)) {
+                                        StreamingError se = detail.unpack(StreamingError.class);
+                                        streamingDetail = ", streamCode=" + se.getCode()
+                                                + ", streamCause=" + se.getCause();
+                                    }
+                                }
+                            }
+                        }
+                    } catch (Exception ignored) {
+                        streamingDetail = ", (detail parsing failed)";
+                    }
+                    log.error("Consume stream error for pchannel={}: code={}, description={}, cause={}{}",
                             pchannelName, status.getCode(), status.getDescription(),
-                            status.getCause() != null ? status.getCause().getMessage() : "none");
+                            status.getCause() != null ? status.getCause().getMessage() : "none",
+                            streamingDetail);
+
+                    // Extract current term from FAILED_PRECONDITION so the caller
+                    // can retry with the correct term instead of giving up.
+                    if (status.getCode() == Status.Code.FAILED_PRECONDITION) {
+                        long term = extractTermFromStatus(status, (StatusRuntimeException) t);
+                        if (term > 0) {
+                            streamLevelCurrentTerm = term;
+                            log.info("Extracted current term={} from FAILED_PRECONDITION for pchannel={}",
+                                    term, pchannelName);
+                        }
+                    }
                 } else {
                     log.error("Consume stream error for pchannel={}: {}", pchannelName, t.getMessage());
                 }
                 streamError = t;
                 isOpen = false;
+            }
+
+            /**
+             * Extract the server's current term from a FAILED_PRECONDITION gRPC status.
+             * Tries multiple sources: status description, grpc-status-details-bin trailer,
+             * gRPC trailers metadata, and regex patterns known from Milvus StreamingNode.
+             */
+            private long extractTermFromStatus(Status status, StatusRuntimeException sre) {
+                // 1. Try status description
+                String desc = status.getDescription();
+                if (desc != null && !desc.isEmpty()) {
+                    Matcher m = CURRENT_TERM_PATTERN.matcher(desc);
+                    if (m.find()) return Long.parseLong(m.group(1));
+                    m = TERM_PATTERN_DESC.matcher(desc);
+                    if (m.find()) return Long.parseLong(m.group(1));
+                    m = TERM_PATTERN_CHANNEL.matcher(desc);
+                    if (m.find()) return Long.parseLong(m.group(2));
+                }
+
+                // 2. Try grpc-status-details-bin trailer — Milvus embeds StreamingError
+                //    with UNMATCHED_CHANNEL_TERM cause: "channel X at term Y is expected,
+                //    but current term is Z"
+                try {
+                    io.grpc.Metadata trailers = sre.getTrailers();
+                    if (trailers != null) {
+                        byte[] statusDetailsBin = trailers.get(
+                                io.grpc.Metadata.Key.of("grpc-status-details-bin",
+                                        io.grpc.Metadata.BINARY_BYTE_MARSHALLER));
+                        if (statusDetailsBin != null) {
+                            com.google.rpc.Status rpcStatus = com.google.rpc.Status.parseFrom(statusDetailsBin);
+                            for (com.google.protobuf.Any detail : rpcStatus.getDetailsList()) {
+                                if (detail.is(StreamingError.class)) {
+                                    StreamingError se = detail.unpack(StreamingError.class);
+                                    if (se.getCode() == StreamingCode.STREAMING_CODE_UNMATCHED_CHANNEL_TERM
+                                            && se.getCause() != null) {
+                                        Matcher m = CURRENT_TERM_PATTERN.matcher(se.getCause());
+                                        if (m.find()) return Long.parseLong(m.group(1));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } catch (Exception e) {
+                    log.debug("Failed to extract term from grpc-status-details-bin: {}", e.getMessage());
+                }
+
+                // 3. Try gRPC trailers metadata
+                try {
+                    io.grpc.Metadata trailers = sre.getTrailers();
+                    if (trailers != null) {
+                        for (String key : trailers.keys()) {
+                            if (key != null && key.toLowerCase().contains("term")) {
+                                String val = trailers.get(
+                                        io.grpc.Metadata.Key.of(key,
+                                                io.grpc.Metadata.ASCII_STRING_MARSHALLER));
+                                if (val != null) {
+                                    try { return Long.parseLong(val.trim()); } catch (NumberFormatException ignored) {}
+                                    Matcher m = CURRENT_TERM_PATTERN.matcher(val);
+                                    if (m.find()) return Long.parseLong(m.group(1));
+                                }
+                            }
+                        }
+                        // Also check common Milvus trailer keys
+                        String[] milvusKeys = {"channel-term", "current-term", "x-milvus-term", "term"};
+                        for (String key : milvusKeys) {
+                            String val = trailers.get(
+                                    io.grpc.Metadata.Key.of(key,
+                                            io.grpc.Metadata.ASCII_STRING_MARSHALLER));
+                            if (val != null) {
+                                try { return Long.parseLong(val.trim()); } catch (NumberFormatException ignored) {}
+                            }
+                        }
+                    }
+                } catch (Exception e) {
+                    log.debug("Failed to extract term from gRPC trailers: {}", e.getMessage());
+                }
+
+                // 4. Try the cause exception's message
+                Throwable cause = status.getCause();
+                if (cause != null && cause.getMessage() != null) {
+                    Matcher m = CURRENT_TERM_PATTERN.matcher(cause.getMessage());
+                    if (m.find()) return Long.parseLong(m.group(1));
+                }
+
+                return -1;
             }
 
             @Override
@@ -304,22 +452,41 @@ public class ConsumeStream implements Iterator<ImmutableMessage>, AutoCloseable 
      * @return the server's current term, or -1 if it cannot be determined
      */
     public long getCurrentTermFromError() {
-        if (createVchannelErrorCode != StreamingCode.STREAMING_CODE_UNMATCHED_CHANNEL_TERM) {
-            return -1;
+        // 1. Stream-level FAILED_PRECONDITION term (highest priority)
+        if (streamLevelCurrentTerm > 0) {
+            return streamLevelCurrentTerm;
         }
-        if (createVchannelErrorCause == null || createVchannelErrorCause.isEmpty()) {
-            return -1;
-        }
-        Matcher m = CURRENT_TERM_PATTERN.matcher(createVchannelErrorCause);
-        if (m.find()) {
-            try {
-                return Long.parseLong(m.group(1));
-            } catch (NumberFormatException e) {
-                log.warn("Failed to parse current term from cause: {}", createVchannelErrorCause);
+
+        // 2. CreateVChannelConsumerResponse UNMATCHED_CHANNEL_TERM
+        if (createVchannelErrorCode == StreamingCode.STREAMING_CODE_UNMATCHED_CHANNEL_TERM) {
+            if (createVchannelErrorCause != null && !createVchannelErrorCause.isEmpty()) {
+                Matcher m = CURRENT_TERM_PATTERN.matcher(createVchannelErrorCause);
+                if (m.find()) {
+                    try {
+                        return Long.parseLong(m.group(1));
+                    } catch (NumberFormatException e) {
+                        log.warn("Failed to parse current term from cause: {}", createVchannelErrorCause);
+                    }
+                }
             }
         }
-        log.warn("UNMATCHED_CHANNEL_TERM error cause does not contain 'current term is <N>': {}",
-                createVchannelErrorCause);
+
+        // 3. Also check FAILED_PRECONDITION from createVchannel response (stream may
+        //    close before delivering the createVchannel response, but the error code
+        //    may still be set on the stream-level)
+        if (grpcStatusCode == io.grpc.Status.Code.FAILED_PRECONDITION) {
+            if (createVchannelErrorCause != null && !createVchannelErrorCause.isEmpty()) {
+                Matcher m = CURRENT_TERM_PATTERN.matcher(createVchannelErrorCause);
+                if (m.find()) {
+                    try {
+                        return Long.parseLong(m.group(1));
+                    } catch (NumberFormatException e) {
+                        // ignore
+                    }
+                }
+            }
+        }
+
         return -1;
     }
 }

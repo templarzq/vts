@@ -62,11 +62,11 @@ public class PChannelResolver {
      * @param rootPath     Milvus root path in etcd (e.g. "by-dev")
      */
     public PChannelResolver(String etcdEndpoint, String rootPath) {
-        this.etcdEndpoint = etcdEndpoint;
+        this.etcdEndpoint = (etcdEndpoint != null && !etcdEndpoint.isEmpty()) ? etcdEndpoint : null;
         this.rootPath = rootPath;
-        this.httpClient = HttpClient.newBuilder()
-                .connectTimeout(Duration.ofSeconds(5))
-                .build();
+        this.httpClient = this.etcdEndpoint != null
+                ? HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build()
+                : null;
     }
 
     /**
@@ -122,6 +122,10 @@ public class PChannelResolver {
      * Load all collection→pchannel mappings from etcd.
      */
     private Map<Long, String> loadAllMappings() {
+        if (etcdEndpoint == null) {
+            log.debug("PChannelResolver: etcd endpoint not configured, skipping channel-cp lookup");
+            return null;
+        }
         String channelCpPrefix = rootPath + "/meta/datacoord-meta/channel-cp/";
         String keyEncoded = base64Encode(channelCpPrefix);
 
