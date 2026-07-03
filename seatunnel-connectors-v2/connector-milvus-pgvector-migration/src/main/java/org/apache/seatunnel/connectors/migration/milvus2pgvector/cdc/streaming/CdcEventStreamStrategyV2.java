@@ -397,6 +397,16 @@ public class CdcEventStreamStrategyV2 implements CdcStrategy {
     private static final int MAX_RECOVERY_RETRIES = 3;
 
     /**
+     * Counter for consecutive empty polls. Used to throttle the
+     * "Poll completed: 0 events, 0 rows" INFO log so it only fires once
+     * every {@link #EMPTY_POLL_INFO_INTERVAL} empty polls (≈1 minute at the
+     * default 1s poll interval), instead of every poll cycle. Reset to 0
+     * whenever a non-empty poll is observed.
+     */
+    private int emptyPollCount = 0;
+    private static final int EMPTY_POLL_INFO_INTERVAL = 60;
+
+    /**
      * Poll for incremental changes since the given position.
      *
      * @param split         the incremental split being read
@@ -484,7 +494,24 @@ public class CdcEventStreamStrategyV2 implements CdcStrategy {
             recoveryRetryCount = 0;
         }
 
-        log.info("Poll completed: {} events, {} rows", eventCount, results.size());
+        // Throttle the "Poll completed: 0 events, 0 rows" log to avoid log spam
+        // during idle incremental periods. Print INFO on the first empty poll
+        // (signals transition to idle), then every EMPTY_POLL_INFO_INTERVAL-th
+        // empty poll (≈1 minute at default 1s poll interval); other empty
+        // polls emit DEBUG only. Non-empty polls always log INFO.
+        if (eventCount == 0 && results.isEmpty()) {
+            emptyPollCount++;
+            if (emptyPollCount == 1 || emptyPollCount % EMPTY_POLL_INFO_INTERVAL == 0) {
+                log.info("Poll completed: {} events, {} rows (idle, consecutive empty polls={})",
+                        eventCount, results.size(), emptyPollCount);
+            } else {
+                log.debug("Poll completed: {} events, {} rows (consecutive empty polls={})",
+                        eventCount, results.size(), emptyPollCount);
+            }
+        } else {
+            emptyPollCount = 0;
+            log.info("Poll completed: {} events, {} rows", eventCount, results.size());
+        }
         return results;
     }
 
