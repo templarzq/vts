@@ -521,12 +521,15 @@ public class CdcEventStreamStrategyV2 implements CdcStrategy {
             recoveryRetryCount = 0;
         }
 
-        // Throttle the "Poll completed: 0 events, 0 rows" log to avoid log spam
-        // during idle incremental periods. Print INFO on the first empty poll
-        // (signals transition to idle), then every EMPTY_POLL_INFO_INTERVAL-th
-        // empty poll (≈1 minute at default 1s poll interval); other empty
-        // polls emit DEBUG only. Non-empty polls always log INFO.
-        if (eventCount == 0 && results.isEmpty()) {
+        // Throttle idle-poll logs (0 data rows) to avoid log spam during steady
+        // incremental sync. Two cases produce no data rows:
+        //   a) eventCount==0: truly idle (no WAL messages at all)
+        //   b) eventCount>0:  barrier/checkpoint messages with no data rows
+        // Print INFO on the first idle poll (signals transition to idle) and
+        // every EMPTY_POLL_INFO_INTERVAL-th idle poll (≈1 minute at default 1s
+        // poll interval); other idle polls emit DEBUG only.
+        // Polls that produce data rows always log INFO.
+        if (results.isEmpty()) {
             emptyPollCount++;
             if (emptyPollCount == 1 || emptyPollCount % EMPTY_POLL_INFO_INTERVAL == 0) {
                 log.info("Poll completed: {} events, {} rows (idle, consecutive empty polls={})",
