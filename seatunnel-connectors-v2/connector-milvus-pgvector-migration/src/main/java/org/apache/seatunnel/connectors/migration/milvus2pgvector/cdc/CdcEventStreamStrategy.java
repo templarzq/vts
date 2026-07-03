@@ -62,6 +62,14 @@ import java.util.concurrent.TimeoutException;
  * {@link ReplicatePosition#messageId} field to store the WAL message ID
  * string so checkpoints can resume from the exact last consumed position.
  */
+/**
+ * @deprecated Since Milvus 2.5.5, StreamingNode gRPC (V2 strategy) is the recommended
+ *             approach. This DumpMessages-based V1 strategy only works in replication
+ *             topology (cluster mode) and is unavailable in standalone deployments.
+ *             Use {@link org.apache.seatunnel.connectors.migration.milvus2pgvector.cdc.streaming.CdcEventStreamStrategyV2}
+ *             instead.
+ */
+@Deprecated
 @Slf4j
 public class CdcEventStreamStrategy implements CdcStrategy {
 

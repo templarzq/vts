@@ -34,6 +34,7 @@
 | 能力 | 说明 |
 | --- | --- |
 | 全量数据迁移 | 迁移向量列、标量列、JSON、数组等所有字段 |
+| **CDC 实时增量同步** | **支持 INSERT / DELETE / UPSERT 实时捕获，基于 Milvus WAL 事件流** |
 | Schema 迁移 | 自动 introspect Milvus Collection，生成并执行 pgvector 建表 DDL |
 | 索引迁移 | 将 Milvus HNSW / IVF_FLAT / AUTOINDEX 等转换为 pgvector 等效索引 |
 | 数据一致性校验 | 记录数校验 + 向量相似度采样校验 + 逐字段采样校验 |
@@ -83,6 +84,146 @@
 - **Schema 阶段**：内省 Milvus Collection 元数据，在 pgvector 侧创建扩展、Schema、表与向量索引。DDL 均为 `IF NOT EXISTS`，可幂等重跑。
 - **Data 阶段**：通过 SeaTunnel 引擎执行批量任务，从 Milvus 读取数据，经 `MilvusToPgVector` Transform 转换后写入 pgvector。
 - **Validation 阶段**：直连两端数据库（不依赖 SeaTunnel），对迁移结果做多维校验。
+
+### 2.1 CDC 实时流式迁移 (STREAMING 模式)
+
+除上述三阶段批处理迁移（`job.mode = "BATCH"`）外，工具还支持 **STREAMING 模式**——通过 `Milvus-CDC` Source 插件订阅 Milvus WAL 事件流，
+实现全量快照 + 实时增量同步（含 **INSERT / DELETE / UPSERT**）。
+
+**模式对比**：
+
+| 特性 | BATCH 模式 | STREAMING 模式 |
+|------|-----------|---------------|
+| Source 插件 | `Milvus` | **`Milvus-CDC`** |
+| job.mode | `BATCH` | `STREAMING` |
+| 全量快照 | ✅ | ✅  (`startup_mode = "INITIAL"`) |
+| 增量 INSERT | ❌ (需重新全量) | ✅ 实时捕获 |
+| 增量 DELETE | ❌ | ✅ (V2 策略) |
+| 增量 UPSERT | ❌ | ✅ (V2 策略) |
+| 运行方式 | 一次性任务 | 常驻进程 |
+| 适用场景 | 一次性全量迁移 | **生产实时同步、灾备、多活** |
+
+**CDC 策略选择**：
+
+| 策略 | 配置值 | 适用场景 | Delete 支持 |
+|------|--------|---------|------------|
+| event_stream V2 (⭐推荐) | `cdc_strategy = "event_stream"`, `cdc_use_streaming_node = true` | **Milvus 2.5.5+ standalone/集群** | ✅ |
+| event_stream V1 | `cdc_strategy = "event_stream"`, `cdc_pchannel = "..."` | Milvus 2.4+ 集群模式（需 replication） | ✅ |
+| grpc_replicate | `cdc_strategy = "grpc_replicate"` | Milvus 2.4+ 启用 CDC 的集群 | ✅ |
+| polling_incremental | `cdc_strategy = "polling_incremental"` | 所有版本（降级方案） | ❌ |
+
+**STREAMING 配置示例 (V2 策略)**：
+
+```hocon
+env {
+  parallelism = 1
+  job.mode = "STREAMING"
+  checkpoint.interval = 30000
+}
+
+source {
+  Milvus-CDC {
+    url = "http://localhost:19530"
+    database = "default"
+    collection = "my_vectors"
+    collections = ["my_vectors"]
+
+    cdc_strategy = "event_stream"
+    cdc_use_streaming_node = true
+    streaming_node_address = "localhost:22222"
+    startup_mode = "INITIAL"
+
+    batch_size = 10000
+    incremental_batch_size = 2000
+    poll_interval_ms = 100
+    primary_key_field = "id"
+  }
+}
+
+transform {
+  MilvusToPgVector {
+    pg_schema = "public"
+    pg_table = "my_vectors"
+    allow_precision_loss = true
+  }
+}
+
+sink {
+  Jdbc {
+    url = "jdbc:postgresql://localhost:5432/vectordb?reWriteBatchedInserts=true"
+    driver = "org.postgresql.Driver"
+    user = "postgres"
+    password = "postgres"
+    compatible_mode = "pgvector"
+    generate_sink_sql = true
+    database = "vectordb"
+    table = "public.my_vectors"
+    batch_size = 2000
+  }
+}
+```
+
+**启动 CDC 同步任务**：
+
+```bash
+cd $SEATUNNEL_HOME
+export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+
+# 本地模式（常驻进程）
+nohup ./bin/seatunnel.sh \
+    --config /path/to/milvus_to_pgvector_cdc.conf \
+    -m local \
+    > /path/to/logs/cdc.log 2>&1 &
+
+# 监控同步状态
+psql -h localhost -U postgres -d vectordb -c "SELECT COUNT(*) FROM public.my_vectors;"
+tail -f /path/to/logs/cdc.log | grep "Poll completed"
+```
+
+**多 Collection 场景**（ADR-0004）：
+
+每个 Collection 需要独立 STREAMING 任务，确保故障隔离和延迟独立：
+
+```bash
+#!/bin/bash
+# 每个 collection 独立启动 CDC 任务
+COLLECTIONS=("articles" "products" "images" "qa_pairs")
+
+for col in "${COLLECTIONS[@]}"; do
+  cat > /tmp/cdc_${col}.conf <<EOF
+env {
+  parallelism = 1
+  job.mode = "STREAMING"
+  checkpoint.interval = 30000
+}
+source {
+  Milvus-CDC {
+    url = "http://localhost:19530"
+    database = "default"
+    collection = "${col}"
+    cdc_strategy = "event_stream"
+    cdc_use_streaming_node = true
+    startup_mode = "INITIAL"
+    batch_size = 10000
+  }
+}
+transform { MilvusToPgVector { pg_schema = "public" pg_table = "${col}" } }
+sink {
+  Jdbc {
+    url = "jdbc:postgresql://localhost:5432/vectordb?reWriteBatchedInserts=true"
+    driver = "org.postgresql.Driver"
+    user = "postgres" password = "postgres"
+    compatible_mode = "pgvector"
+    generate_sink_sql = true
+    database = "vectordb" table = "public.${col}"
+  }
+}
+EOF
+  nohup ./bin/seatunnel.sh --config /tmp/cdc_${col}.conf -m local \
+    > /path/to/logs/cdc_${col}.log 2>&1 &
+  echo "Started CDC for collection: ${col}"
+done
+```
 
 ---
 
@@ -686,21 +827,44 @@ Overall         : SUCCESS
 
 ## 13. 性能调优
 
-### 13.1 关键参数
+### 13.1 实测性能基准
+
+> 测试环境：Milvus 2.6.9 standalone (localhost:19530), PostgreSQL 14 + pgvector (localhost:5432), JDK 17
+
+| 数据规模 | 同步模式 | 耗时 | 吞吐量 | 关键配置 |
+|----------|---------|------|--------|---------|
+| 500 行 | 全量快照 | ~5s | ~100 rows/s | 默认配置 |
+| 50,000 行 | 全量快照 | ~12s | **~4,200 rows/s** | batch_size=10000, JDBC batch_size=2000 |
+| 1,000 行 upsert | 增量 WAL | ~2s | — | 实时捕获 Delete+Insert 对 |
+| 4,000 行 insert | 增量 WAL | ~3s | — | 实时写入 |
+| 5,000 行 delete | 增量 WAL | ~5s | — | 每 1000 PK 一批 |
+
+### 13.2 BATCH 模式关键参数
 
 | 参数 | 建议 | 说明 |
 | --- | --- | --- |
-| `--batch-size` | 1000~5000 | 过小则 RPC 开销大；过大则内存占用高 |
+| `--batch-size` | 1000~10000 | 过小则 RPC 开销大；过大则内存占用高 |
 | `--parallelism` | 2~8 | 受 SeaTunnel slot 数限制；向量库 IO 密集型，并非越高越好 |
 | `--rate-limit` | 按源库承载能力设置 | 保护生产 Milvus，如 5000 行/秒 |
 
-### 13.2 SeaTunnel 引擎侧
+### 13.3 STREAMING 模式关键参数
+
+| 参数 | 默认值 | 推荐值 | 影响 |
+|------|--------|--------|------|
+| `batch_size` (source) | 1000 | **5000-10000** | 全量快照读取速度，大值减少 RPC 次数 |
+| `incremental_batch_size` | 500 | **1000-2000** | 增量每批最大事件数 |
+| JDBC `batch_size` (sink) | 100 | **1000-2000** | 数据库写入批量，大值减少 SQL 执行次数 |
+| JDBC `reWriteBatchedInserts` | false | **true** | PostgreSQL INSERT 批量重写，2-3x 写入提升 |
+| `poll_interval_ms` | 1000 | **100** | 增量事件响应延迟，低值更快感知变更 |
+| Snapshot `assignPendingSplits` | — | — | **代码层面**：分配后立即清除，防止重复全量扫描 |
+
+### 13.4 SeaTunnel 引擎侧
 
 - 调整 `config/jvm_options`、`jvm_worker_options` 的堆内存（向量数据内存占用大）。
 - 集群模式下适当增加 worker 数量。
 - 大表迁移建议分批跑（按 Collection 拆分任务）。
 
-### 13.3 pgvector 侧
+### 13.5 pgvector 侧
 
 - 大表先建表灌数据，**数据导入完成后再建索引**（用 `--skip-index-migration` 跑数据，随后单独建索引）。
 - 临时调大 `maintenance_work_mem` 加速 HNSW 索引构建：

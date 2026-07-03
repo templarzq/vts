@@ -51,4 +51,11 @@ public class MilvusCdcSourceState implements Serializable {
 
     /** Global high watermark (maximum timeTick across all incremental splits). */
     private long globalTimeTick;
+
+    /**
+     * WAL position captured before snapshot begins. Used as the start point for
+     * the incremental phase to avoid full WAL replay via {@code DeliverPolicy.all}.
+     * Per-collection mapping: key = collectionName.
+     */
+    private Map<String, ReplicatePosition> snapStartPositions;
 }

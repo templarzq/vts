@@ -120,7 +120,12 @@ public class CdcEventStreamStrategyV2 implements CdcStrategy {
         // Initialize pchannel resolver for etcd-based auto-discovery
         this.pchannelResolver = new PChannelResolver(
                 config.getCdcEtcdEndpoint(),
-                extractRootPath(config));
+                extractRootPath(config),
+                config.getCdcEtcdCaPath(),
+                config.getCdcEtcdClientCertPath(),
+                config.getCdcEtcdClientKeyPath(),
+                config.getCdcEtcdUsername(),
+                config.getCdcEtcdPassword());
 
         log.info("CdcEventStreamStrategyV2 initialized: pchannel={}, vchannel={}, collectionId={}, streamingNode={}",
                 pchannelName, vchannelName, collectionId, streamingNodeAddress);
@@ -687,6 +692,82 @@ public class CdcEventStreamStrategyV2 implements CdcStrategy {
      */
     public ReplicatePosition getLastPosition() {
         return lastPosition;
+    }
+
+    /**
+     * Capture the current WAL position by briefly opening a Consume stream and
+     * reading one message. Used to establish the SnapStartPosition before snapshot
+     * begins, so the incremental phase can start from this position rather than
+     * replaying the entire WAL.
+     *
+     * @param collectionName collection to capture position for
+     * @return current WAL position, or null if unavailable
+     */
+    @Override
+    public ReplicatePosition captureCurrentPosition(String collectionName) {
+        if (pchannelName == null || pchannelName.isEmpty()) {
+            // Auto-discover pchannel first if not yet resolved
+            String etcdPchan = resolvePchannelFromEtcd();
+            if (etcdPchan != null) {
+                pchannelName = etcdPchan;
+            } else {
+                log.warn("Cannot capture SnapStartPosition: no pchannel resolved for collectionId={}",
+                        collectionId);
+                return null;
+            }
+        }
+
+        String vchan = pchannelName + "_" + collectionId + "v0";
+        DeliverPolicy policy = DeliverPolicy.newBuilder()
+                .setAll(Empty.newBuilder().build())
+                .build();
+
+        ConsumeStream tempStream = null;
+        try {
+            tempStream = tryCreateStream(pchannelName, vchan, policy,
+                    cachedTerm > 0 ? cachedTerm : 1);
+            if (tempStream == null) {
+                long ct = lastStreamCurrentTerm;
+                if (ct > 0) {
+                    tempStream = tryCreateStream(pchannelName, vchan, policy, ct);
+                }
+            }
+            if (tempStream == null || !tempStream.isOpen()) {
+                log.warn("Failed to open temporary Consume stream for SnapStartPosition capture");
+                return null;
+            }
+
+            // Wait briefly for the first message
+            Thread.sleep(50);
+            if (tempStream.hasNext()) {
+                ImmutableMessage msg = tempStream.next();
+                MessageID msgId = parser.extractMessageID(msg);
+                long timetick = parser.extractTimetick(msg);
+                ReplicatePosition pos = ReplicatePosition.builder()
+                        .clusterId(sourceClusterId)
+                        .pchannel(pchannelName)
+                        .messageId(msgId.getId().toStringUtf8())
+                        .timeTick(timetick)
+                        .timestamp(System.currentTimeMillis())
+                        .build();
+                log.info("Captured SnapStartPosition: pchannel={}, messageId={}, timeTick={}",
+                        pchannelName, pos.getMessageId(), timetick);
+                return pos;
+            } else {
+                log.warn("No message received from temporary Consume stream for SnapStartPosition");
+                return null;
+            }
+        } catch (Exception e) {
+            log.warn("Failed to capture SnapStartPosition: {}", e.getMessage());
+            return null;
+        } finally {
+            if (tempStream != null) {
+                try {
+                    tempStream.close();
+                } catch (Exception ignored) {
+                }
+            }
+        }
     }
 
     /**

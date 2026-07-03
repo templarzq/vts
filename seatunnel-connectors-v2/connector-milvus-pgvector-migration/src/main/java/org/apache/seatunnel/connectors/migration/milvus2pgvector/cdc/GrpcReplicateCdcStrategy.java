@@ -50,6 +50,14 @@ import java.util.List;
  * Milvus exposes a public CDC subscription API, and to let users explicitly opt
  * into the "grpc_replicate" mode via configuration.
  */
+/**
+ * @deprecated Since Milvus 2.5.5, StreamingNode gRPC (V2 strategy) captures full
+ *             CDC semantics (INSERT/DELETE/UPSERT). This gRPC-Replicate-based strategy
+ *             offers no advantage over polling_incremental and will be removed.
+ *             Use {@link org.apache.seatunnel.connectors.migration.milvus2pgvector.cdc.streaming.CdcEventStreamStrategyV2}
+ *             or {@link PollingIncrementalCdcStrategy} instead.
+ */
+@Deprecated
 @Slf4j
 public class GrpcReplicateCdcStrategy implements CdcStrategy {
 

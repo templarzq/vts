@@ -72,6 +72,7 @@ public class MilvusCdcSourceSplitEnumerator
     private boolean snapshotCompleted;
     private Map<String, ReplicatePosition> splitPositions;
     private long globalTimeTick;
+    private Map<String, ReplicatePosition> snapStartPositions;
     private Set<Integer> readersWithCompletedSnapshot;
 
     public MilvusCdcSourceSplitEnumerator(
@@ -93,10 +94,14 @@ public class MilvusCdcSourceSplitEnumerator
                     ? new HashMap<>(sourceState.getSplitPositions())
                     : new HashMap<>();
             this.globalTimeTick = sourceState.getGlobalTimeTick();
+            this.snapStartPositions = sourceState.getSnapStartPositions() != null
+                    ? new HashMap<>(sourceState.getSnapStartPositions())
+                    : new HashMap<>();
         } else {
             this.snapshotCompleted = false;
             this.splitPositions = new HashMap<>();
             this.globalTimeTick = 0;
+            this.snapStartPositions = new HashMap<>();
         }
     }
 
@@ -171,6 +176,31 @@ public class MilvusCdcSourceSplitEnumerator
                             ipe.getPosition().getTimeTick());
                 }
             }
+        } else if (event instanceof SnapStartPositionEvent) {
+            SnapStartPositionEvent sse = (SnapStartPositionEvent) event;
+            synchronized (stateLock) {
+                snapStartPositions.put(sse.getCollectionName(), sse.getPosition());
+                log.info("SnapStartPosition captured for collection='{}': messageId={}, timeTick={}",
+                        sse.getCollectionName(),
+                        sse.getPosition() != null ? sse.getPosition().getMessageId() : "null",
+                        sse.getPosition() != null ? sse.getPosition().getTimeTick() : 0);
+            }
+        } else if (event instanceof CheckpointInvalidatedEvent) {
+            CheckpointInvalidatedEvent cie = (CheckpointInvalidatedEvent) event;
+            log.warn("Checkpoint invalidated for split '{}' (reason: {}). "
+                    + "Resetting to INITIAL mode — re-running full snapshot.",
+                    cie.getSplitId(), cie.getReason());
+            synchronized (stateLock) {
+                snapshotCompleted = false;
+                splitPositions.clear();
+                globalTimeTick = 0;
+                // Keep snapStartPositions — they will be re-captured
+            }
+            try {
+                run();
+            } catch (Exception e) {
+                log.error("Error resetting to INITIAL after checkpoint invalidation", e);
+            }
         }
     }
 
@@ -188,6 +218,7 @@ public class MilvusCdcSourceSplitEnumerator
                     .pendingSplits(allPending)
                     .splitPositions(new HashMap<>(splitPositions))
                     .globalTimeTick(globalTimeTick)
+                    .snapStartPositions(new HashMap<>(snapStartPositions))
                     .lastPollTime(System.currentTimeMillis())
                     .build();
         }
@@ -371,6 +402,14 @@ public class MilvusCdcSourceSplitEnumerator
             for (int readerId : context.registeredReaders()) {
                 String splitId = "cdc-inc-" + collectionName + "-" + idx++;
                 ReplicatePosition startPos = splitPositions.get(splitId);
+                // Fall back to SnapStartPosition for fresh runs (avoids DeliverPolicy.all)
+                if (startPos == null) {
+                    startPos = snapStartPositions.get(collectionName);
+                    if (startPos != null) {
+                        log.info("Using SnapStartPosition for collection '{}': messageId={}",
+                                collectionName, startPos.getMessageId());
+                    }
+                }
 
                 MilvusCdcSourceSplit incSplit = MilvusCdcSourceSplit.builder()
                         .splitId(splitId)
@@ -408,11 +447,13 @@ public class MilvusCdcSourceSplitEnumerator
     }
 
     private void assignPendingSplits() {
-        for (Map.Entry<Integer, List<MilvusCdcSourceSplit>> entry : pendingSplits.entrySet()) {
-            int readerId = entry.getKey();
-            List<MilvusCdcSourceSplit> splits = entry.getValue();
-            if (!splits.isEmpty() && context.registeredReaders().contains(readerId)) {
-                context.assignSplit(readerId, new ArrayList<>(splits));
+        // Collect reader IDs first to avoid ConcurrentModificationException
+        List<Integer> readerIds = new ArrayList<>(pendingSplits.keySet());
+        for (int readerId : readerIds) {
+            List<MilvusCdcSourceSplit> splits = pendingSplits.remove(readerId);
+            if (splits != null && !splits.isEmpty()
+                    && context.registeredReaders().contains(readerId)) {
+                context.assignSplit(readerId, splits);
             }
         }
     }

@@ -48,4 +48,15 @@ public interface CdcStrategy extends Closeable {
     default boolean isAvailable() {
         return true;
     }
+
+    /**
+     * Capture the current WAL position for use as the incremental phase start point
+     * after snapshot completion. Called once before snapshot begins.
+     *
+     * @param collectionName collection to capture position for
+     * @return current WAL position, or null if not supported / unavailable
+     */
+    default ReplicatePosition captureCurrentPosition(String collectionName) {
+        return null;
+    }
 }

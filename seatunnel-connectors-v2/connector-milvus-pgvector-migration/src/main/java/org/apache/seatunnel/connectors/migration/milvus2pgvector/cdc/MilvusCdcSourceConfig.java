@@ -98,13 +98,12 @@ public class MilvusCdcSourceConfig implements Serializable {
     public static final Option<String> CDC_STRATEGY =
             Options.key("cdc_strategy")
                     .stringType()
-                    .defaultValue("polling_incremental")
+                    .defaultValue("event_stream")
                     .withDescription(
-                            "CDC strategy - one of \"polling_incremental\" (default, PK-based "
-                                    + "query iteration), \"grpc_replicate\" (PK-based query with "
-                                    + "replicate position tracking), or \"event_stream\" (real "
-                                    + "WAL event capture via DumpMessages gRPC; supports delete "
-                                    + "and same-PK update detection)");
+                            "CDC strategy — \"event_stream\" (recommended, StreamingNode gRPC V2, "
+                                    + "supports INSERT/DELETE/UPSERT) or \"polling_incremental\" "
+                                    + "(fallback, PK-based query iteration, cannot capture deletes). "
+                                    + "Deprecated strategies: \"grpc_replicate\", legacy \"event_stream\" (V1).");
 
     public static final Option<String> STREAMING_NODE_ADDRESS =
             Options.key("streaming_node_address")
@@ -202,6 +201,44 @@ public class MilvusCdcSourceConfig implements Serializable {
                                     + "Used by event_stream strategy to find the correct "
                                     + "pchannel for a collection from etcd channel-cp data.");
 
+    public static final Option<String> CDC_ETCD_CA_PATH =
+            Options.key("cdc_etcd_ca_path")
+                    .stringType()
+                    .noDefaultValue()
+                    .withDescription("Path to CA certificate for etcd TLS connection");
+
+    public static final Option<String> CDC_ETCD_CLIENT_CERT_PATH =
+            Options.key("cdc_etcd_client_cert_path")
+                    .stringType()
+                    .noDefaultValue()
+                    .withDescription("Path to client certificate for etcd mTLS");
+
+    public static final Option<String> CDC_ETCD_CLIENT_KEY_PATH =
+            Options.key("cdc_etcd_client_key_path")
+                    .stringType()
+                    .noDefaultValue()
+                    .withDescription("Path to client key for etcd mTLS");
+
+    public static final Option<String> CDC_ETCD_USERNAME =
+            Options.key("cdc_etcd_username")
+                    .stringType()
+                    .noDefaultValue()
+                    .withDescription("etcd username for basic auth (RBAC)");
+
+    public static final Option<String> CDC_ETCD_PASSWORD =
+            Options.key("cdc_etcd_password")
+                    .stringType()
+                    .noDefaultValue()
+                    .withDescription("etcd password for basic auth (RBAC)");
+
+    public static final Option<Boolean> CDC_AUTO_RECOVER_STALE_POSITION =
+            Options.key("cdc_auto_recover_stale_position")
+                    .booleanType()
+                    .defaultValue(true)
+                    .withDescription("Automatically re-run INITIAL snapshot when checkpoint "
+                            + "position is no longer valid (e.g., WAL has been GC'd). "
+                            + "Default: true.");
+
     public static final Option<String> CDC_SOURCE_CLUSTER_ID =
             Options.key("cdc_source_cluster_id")
                     .stringType()
@@ -250,6 +287,12 @@ public class MilvusCdcSourceConfig implements Serializable {
     private String cdcStartMessageId;
     private String streamingNodeAddress;
     private Boolean cdcUseStreamingNode;
+    private String cdcEtcdCaPath;
+    private String cdcEtcdClientCertPath;
+    private String cdcEtcdClientKeyPath;
+    private String cdcEtcdUsername;
+    private String cdcEtcdPassword;
+    private Boolean cdcAutoRecoverStalePosition;
 
     public static MilvusCdcSourceConfig of(ReadonlyConfig config) {
         return MilvusCdcSourceConfig.builder()
@@ -277,6 +320,12 @@ public class MilvusCdcSourceConfig implements Serializable {
                 .streamingNodeAddress(config.get(STREAMING_NODE_ADDRESS))
                 .cdcUseStreamingNode(config.get(CDC_USE_STREAMING_NODE))
                 .collections(config.get(COLLECTIONS))
+                .cdcEtcdCaPath(config.get(CDC_ETCD_CA_PATH))
+                .cdcEtcdClientCertPath(config.get(CDC_ETCD_CLIENT_CERT_PATH))
+                .cdcEtcdClientKeyPath(config.get(CDC_ETCD_CLIENT_KEY_PATH))
+                .cdcEtcdUsername(config.get(CDC_ETCD_USERNAME))
+                .cdcEtcdPassword(config.get(CDC_ETCD_PASSWORD))
+                .cdcAutoRecoverStalePosition(config.get(CDC_AUTO_RECOVER_STALE_POSITION))
                 .build();
     }
 

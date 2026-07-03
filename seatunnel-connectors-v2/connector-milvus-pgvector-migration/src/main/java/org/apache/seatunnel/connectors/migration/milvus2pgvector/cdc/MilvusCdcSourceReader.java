@@ -106,6 +106,19 @@ public class MilvusCdcSourceReader implements SourceReader<SeaTunnelRow, MilvusC
         this.cdcStrategy = createCdcStrategy();
         log.info("MilvusCdcSourceReader opened. Strategy: {}, Collection: {}",
                 cdcStrategy.getClass().getSimpleName(), cdcConfig.getCollection());
+
+        // Capture SnapStartPosition before snapshot begins (ADR-0002).
+        // This avoids full WAL replay via DeliverPolicy.all on fresh runs.
+        if ("INITIAL".equalsIgnoreCase(cdcConfig.getStartupMode())) {
+            String colName = cdcConfig.getEffectiveCollection();
+            if (colName != null) {
+                ReplicatePosition snapPos = cdcStrategy.captureCurrentPosition(colName);
+                if (snapPos != null) {
+                    context.sendSourceEventToEnumerator(
+                            new SnapStartPositionEvent(colName, snapPos));
+                }
+            }
+        }
     }
 
     @Override
@@ -160,25 +173,74 @@ public class MilvusCdcSourceReader implements SourceReader<SeaTunnelRow, MilvusC
 
         ReplicatePosition startPosition = split.getStartPosition();
 
-        List<SeaTunnelRowWithPosition> events =
-                cdcStrategy.pollChanges(split, startPosition);
+        try {
+            List<SeaTunnelRowWithPosition> events =
+                    cdcStrategy.pollChanges(split, startPosition);
 
-        for (SeaTunnelRowWithPosition rowPos : events) {
-            output.collect(rowPos.getRow());
+            for (SeaTunnelRowWithPosition rowPos : events) {
+                output.collect(rowPos.getRow());
+            }
+
+            // Update the split's start position for the next poll
+            if (!events.isEmpty()) {
+                SeaTunnelRowWithPosition lastEvent = events.get(events.size() - 1);
+                split.setStartPosition(lastEvent.getPosition());
+
+                // Report position to enumerator for checkpointing
+                context.sendSourceEventToEnumerator(
+                        new IncrementalPositionEvent(split.splitId(), lastEvent.getPosition()));
+            }
+
+            // Re-queue the incremental split to keep the stream alive
+            pendingSplits.addFirst(split);
+
+        } catch (io.grpc.StatusRuntimeException e) {
+            io.grpc.Status.Code code = e.getStatus().getCode();
+            // UNMATCHED_CHANNEL_TERM / FAILED_PRECONDITION: stream recovery handled
+            // internally by CdcEventStreamStrategyV2 on the next poll. Re-queue and retry.
+            if (code == io.grpc.Status.Code.FAILED_PRECONDITION) {
+                log.warn("Consume stream FAILED_PRECONDITION (may be term change), "
+                        + "re-queuing for automatic recovery");
+                pendingSplits.addFirst(split);
+                return;
+            }
+            // NOT_FOUND / INVALID_ARGUMENT: WAL position no longer valid (GC'd).
+            // Trigger INITIAL recovery via CheckpointInvalidatedEvent.
+            if (code == io.grpc.Status.Code.NOT_FOUND
+                    || code == io.grpc.Status.Code.INVALID_ARGUMENT) {
+                if (Boolean.TRUE.equals(cdcConfig.getCdcAutoRecoverStalePosition())) {
+                    log.warn("CDC position stale ({}: {}), triggering INITIAL recovery",
+                            code, e.getMessage());
+                    context.sendSourceEventToEnumerator(
+                            new CheckpointInvalidatedEvent(split.splitId(),
+                                    "WAL position no longer valid: " + e.getMessage()));
+                } else {
+                    log.error("CDC position stale ({}: {}) and auto-recovery is disabled",
+                            code, e.getMessage());
+                    throw e;
+                }
+            } else {
+                throw e;
+            }
+        } catch (RuntimeException e) {
+            // Distinguish transient failures from fatal ones via message inspection.
+            // The strategy's internal recovery for term mismatch will throw
+            // after MAX_RECOVERY_RETRIES — treat that as fatal and trigger INITIAL.
+            String msg = e.getMessage();
+            if (msg != null && msg.contains("recovery exceeded max retries")) {
+                if (Boolean.TRUE.equals(cdcConfig.getCdcAutoRecoverStalePosition())) {
+                    log.warn("CDC recovery exhausted, triggering INITIAL recovery: {}", msg);
+                    context.sendSourceEventToEnumerator(
+                            new CheckpointInvalidatedEvent(split.splitId(),
+                                    "Recovery retries exhausted: " + msg));
+                } else {
+                    log.error("CDC recovery exhausted and auto-recovery is disabled: {}", msg);
+                    throw e;
+                }
+            } else {
+                throw e;
+            }
         }
-
-        // Update the split's start position for the next poll
-        if (!events.isEmpty()) {
-            SeaTunnelRowWithPosition lastEvent = events.get(events.size() - 1);
-            split.setStartPosition(lastEvent.getPosition());
-
-            // Report position to enumerator for checkpointing
-            context.sendSourceEventToEnumerator(
-                    new IncrementalPositionEvent(split.splitId(), lastEvent.getPosition()));
-        }
-
-        // Re-queue the incremental split to keep the stream alive
-        pendingSplits.addFirst(split);
     }
 
     // ---- Lifecycle ----
@@ -253,7 +315,7 @@ public class MilvusCdcSourceReader implements SourceReader<SeaTunnelRow, MilvusC
 
         if ("event_stream".equalsIgnoreCase(strategyType)) {
             if (Boolean.TRUE.equals(cdcConfig.getCdcUseStreamingNode())) {
-                // V2 strategy: StreamingNode gRPC (works in standalone mode).
+                // V2 strategy: StreamingNode gRPC (works in standalone + cluster mode).
                 // cdc_pchannel is optional — auto-discovery from etcd + 0-15 scan.
                 CdcEventStreamStrategyV2 v2Strategy = new CdcEventStreamStrategyV2(
                         cdcConfig, collectionDesc);
@@ -261,56 +323,22 @@ public class MilvusCdcSourceReader implements SourceReader<SeaTunnelRow, MilvusC
                     log.info("Using event_stream V2 CDC strategy via StreamingNode gRPC");
                     return v2Strategy;
                 }
-                log.warn("event_stream V2 (StreamingNode) not available. This is expected if "
-                        + "Milvus < 2.5.5 (StreamingNodeHandlerService absent) or no valid "
-                        + "pchannel was found. Falling back to polling_incremental strategy. "
-                        + "Note: polling_incremental can detect new PK inserts but cannot "
-                        + "capture deletes or same-PK updates.");
+                log.warn("event_stream V2 (StreamingNode) not available. Falling back to "
+                        + "polling_incremental. Note: polling_incremental cannot capture "
+                        + "deletes or same-PK updates.");
                 try {
                     v2Strategy.close();
-                } catch (Exception e) {
-                    log.debug("Error closing unavailable event_stream V2 strategy", e);
+                } catch (Exception ex) {
+                    log.debug("Error closing unavailable V2 strategy", ex);
                 }
-                // Skip legacy event_stream (DumpMessages) — it is unavailable on all
-                // Milvus versions in standalone mode. Fall through directly to
-                // polling_incremental at the end of this method.
-            } else if (cdcConfig.getCdcPchannel() == null
-                    || cdcConfig.getCdcPchannel().isEmpty()) {
-                log.error("cdc_strategy=event_stream (legacy) requires cdc_pchannel to be set; "
-                        + "falling back to polling_incremental strategy");
             } else {
-                // Legacy strategy: DumpMessages API (requires replication topology)
-                CdcEventStreamStrategy streamStrategy =
-                        new CdcEventStreamStrategy(cdcConfig, collectionDesc);
-                if (streamStrategy.isAvailable()) {
-                    log.info("Using event_stream CDC strategy (pchannel={})",
-                            cdcConfig.getCdcPchannel());
-                    return streamStrategy;
-                }
-                log.warn("event_stream CDC not available (GetReplicateInfo returned no checkpoint); "
-                        + "falling back to polling_incremental strategy");
-                try {
-                    streamStrategy.close();
-                } catch (Exception e) {
-                    log.debug("Error closing unavailable event_stream strategy", e);
-                }
+                log.warn("cdc_use_streaming_node=false is deprecated — V2 is the only "
+                        + "recommended event_stream mode. Falling back to polling_incremental.");
             }
         }
 
-        if ("grpc_replicate".equalsIgnoreCase(strategyType)) {
-            GrpcReplicateCdcStrategy grpcStrategy =
-                    new GrpcReplicateCdcStrategy(cdcConfig);
-            if (grpcStrategy.isAvailable()) {
-                log.info("Using gRPC ReplicateMessage CDC strategy");
-                return grpcStrategy;
-            }
-            log.warn("gRPC CDC not available, falling back to polling incremental strategy");
-            try {
-                grpcStrategy.close();
-            } catch (Exception e) {
-                log.debug("Error closing unavailable gRPC strategy", e);
-            }
-        }
+        // grpc_replicate and legacy event_stream V1 are deprecated (ADR-0001).
+        // They are no longer instantiated — fall through to polling_incremental.
 
         log.info("Using polling incremental CDC strategy");
         return new PollingIncrementalCdcStrategy(cdcConfig, converter, tableSchema);
