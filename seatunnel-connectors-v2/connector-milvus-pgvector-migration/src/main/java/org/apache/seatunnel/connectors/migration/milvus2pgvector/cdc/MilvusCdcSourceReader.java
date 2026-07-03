@@ -261,14 +261,19 @@ public class MilvusCdcSourceReader implements SourceReader<SeaTunnelRow, MilvusC
                     log.info("Using event_stream V2 CDC strategy via StreamingNode gRPC");
                     return v2Strategy;
                 }
-                log.warn("event_stream V2 (StreamingNode) not available; "
-                        + "falling back to legacy event_stream or polling_incremental");
+                log.warn("event_stream V2 (StreamingNode) not available. This is expected if "
+                        + "Milvus < 2.5.5 (StreamingNodeHandlerService absent) or no valid "
+                        + "pchannel was found. Falling back to polling_incremental strategy. "
+                        + "Note: polling_incremental can detect new PK inserts but cannot "
+                        + "capture deletes or same-PK updates.");
                 try {
                     v2Strategy.close();
                 } catch (Exception e) {
                     log.debug("Error closing unavailable event_stream V2 strategy", e);
                 }
-                // Fall through to legacy event_stream
+                // Skip legacy event_stream (DumpMessages) — it is unavailable on all
+                // Milvus versions in standalone mode. Fall through directly to
+                // polling_incremental at the end of this method.
             } else if (cdcConfig.getCdcPchannel() == null
                     || cdcConfig.getCdcPchannel().isEmpty()) {
                 log.error("cdc_strategy=event_stream (legacy) requires cdc_pchannel to be set; "

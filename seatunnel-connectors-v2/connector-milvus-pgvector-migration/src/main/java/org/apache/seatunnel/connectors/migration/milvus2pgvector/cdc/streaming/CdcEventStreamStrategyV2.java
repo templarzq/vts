@@ -129,7 +129,19 @@ public class CdcEventStreamStrategyV2 implements CdcStrategy {
     /**
      * Check if StreamingNode gRPC is available and the pchannel is valid.
      *
-     * <p>Discovery order:
+     * <p>Version compatibility matrix (auto-detected via capability probing, no
+     * version-string parsing):
+     * <ul>
+     *   <li><b>Milvus &lt; 2.5.5</b> — StreamingNodeHandlerService does not exist.
+     *       Both GetReplicateCheckpoint and Consume return UNIMPLEMENTED → return false.</li>
+     *   <li><b>Milvus 2.5.5+</b> — StreamingNodeHandlerService.Consume exists, but
+     *       GetReplicateCheckpoint RPC is not yet introduced. GetReplicateCheckpoint
+     *       returns UNIMPLEMENTED, but Consume probing succeeds → return true.</li>
+     *   <li><b>Milvus 2.6.0+</b> — Full support: GetReplicateCheckpoint succeeds
+     *       (or FAILED_PRECONDITION in standalone mode) → return true.</li>
+     * </ul>
+     *
+     * <p>Discovery order for a valid pchannel:
      * <ol>
      *   <li>If {@code cdc_pchannel} is configured, try it first; otherwise skip to step 2.</li>
      *   <li>Query etcd for the channel-cp key matching this collection.</li>
@@ -138,10 +150,11 @@ public class CdcEventStreamStrategyV2 implements CdcStrategy {
      *
      * <p>Two-step probe per candidate pchannel:
      * <ol>
-     *   <li>Call {@code GetReplicateCheckpoint} to verify the StreamingNode service is
-     *       reachable. UNIMPLEMENTED (wrong port) or UNAVAILABLE (connection refused)
-     *       → return false immediately.</li>
-     *   <li>If the service is reachable, try opening a Consume stream.</li>
+     *   <li>Call {@code GetReplicateCheckpoint} (if available) to verify the
+     *       StreamingNode service is reachable. FAILED_PRECONDITION (2.6 standalone)
+     *       and UNIMPLEMENTED (2.5.5 — RPC absent but service exists) both proceed
+     *       to Consume probing. UNAVAILABLE (service not started) → return false.</li>
+     *   <li>Try opening a Consume stream — this is the authoritative capability test.</li>
      * </ol>
      *
      * @return true if StreamingNode service is reachable AND a valid pchannel is found
@@ -149,10 +162,12 @@ public class CdcEventStreamStrategyV2 implements CdcStrategy {
     @Override
     public boolean isAvailable() {
 
-        // Step 1: Verify StreamingNode service is reachable via GetReplicateCheckpoint.
-        // FAILED_PRECONDITION is expected in standalone mode (replication not enabled),
-        // but the service is still reachable. UNIMPLEMENTED/UNAVAILABLE means the service
-        // is not reachable at all.
+        // Step 1: Probe StreamingNode service reachability via GetReplicateCheckpoint.
+        // This RPC only exists in Milvus >= 2.6. Its response code distinguishes:
+        //   - OK / FAILED_PRECONDITION → Milvus 2.6+, service reachable (proceed)
+        //   - UNIMPLEMENTED            → Milvus 2.5.5 (Consume exists) or 2.4 (no service).
+        //                                 Must probe Consume to distinguish.
+        //   - UNAVAILABLE              → Service not started / wrong port (give up).
         // When pchannelName is not configured, use a standard fallback for the health probe.
         String healthPchan = (pchannelName != null && !pchannelName.isEmpty())
                 ? pchannelName
@@ -165,14 +180,26 @@ public class CdcEventStreamStrategyV2 implements CdcStrategy {
                     .build();
 
             streamingNodeClient.getReplicateCheckpoint(pchannel);
-            log.info("StreamingNode service reachable for pchannel={} (checkpoint RPC succeeded)",
+            log.info("StreamingNode service reachable for pchannel={} (GetReplicateCheckpoint succeeded, Milvus >= 2.6)",
                     healthPchan);
         } catch (io.grpc.StatusRuntimeException e) {
             io.grpc.Status.Code code = e.getStatus().getCode();
             if (code == io.grpc.Status.Code.FAILED_PRECONDITION) {
+                // Milvus 2.6.x standalone: replication not enabled, but service is reachable.
                 log.info("StreamingNode service reachable (FAILED_PRECONDITION on checkpoint, "
                         + "proceeding to pchannel validation via Consume RPC)");
+            } else if (code == io.grpc.Status.Code.UNIMPLEMENTED) {
+                // GetReplicateCheckpoint RPC absent. Two possibilities:
+                //   - Milvus 2.5.5+: StreamingNodeHandlerService exists (Consume available)
+                //     but GetReplicateCheckpoint not yet introduced.
+                //   - Milvus < 2.5.5: StreamingNodeHandlerService does not exist at all.
+                // The Consume-based probing below distinguishes the two cases: 2.5.5 will
+                // pass, 2.4 will fail and isAvailable() returns false (caller falls back to
+                // polling_incremental).
+                log.info("GetReplicateCheckpoint UNIMPLEMENTED (Milvus < 2.6 or StreamingNode absent); "
+                        + "proceeding to Consume RPC probing for capability detection");
             } else {
+                // UNAVAILABLE etc.: StreamingNode service not reachable at all.
                 log.warn("StreamingNode gRPC not reachable: {} (code={})", e.getMessage(), code);
                 return false;
             }
