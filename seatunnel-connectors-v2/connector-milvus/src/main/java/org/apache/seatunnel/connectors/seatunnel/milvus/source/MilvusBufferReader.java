@@ -34,22 +34,27 @@ public class MilvusBufferReader {
     private final MilvusSourceSplit split;
     private final CountDownLatch completionSignal = new CountDownLatch(1);
     private long rateLimitRetryIntervalMs = 30000;
+    /** Optional rate limiter callback — called with batch size before reading each batch. */
+    private final java.util.function.IntConsumer rateLimiter;
 
     public MilvusBufferReader(MilvusSourceSplit split, Collector<SeaTunnelRow> output,
                               MilvusClientV2 client, TableSchema tableSchema) {
+        this(split, output, client, tableSchema, null);
+    }
+
+    public MilvusBufferReader(MilvusSourceSplit split, Collector<SeaTunnelRow> output,
+                              MilvusClientV2 client, TableSchema tableSchema,
+                              java.util.function.IntConsumer rateLimiter) {
         this.output = output;
         this.milvusClient = client;
         this.tableSchema = tableSchema;
         this.split = split;
+        this.rateLimiter = rateLimiter;
         this.milvusSourceConverter = new MilvusSourceConverter(tableSchema);
         this.collectionName = split.getTablePath().getTableName();
         this.partitionName = split.getPartitionName();
         this.offset = split.getOffset();
         this.limit = split.getLimit();
-    }
-
-    void setRateLimitRetryIntervalMs(long rateLimitRetryIntervalMs) {
-        this.rateLimitRetryIntervalMs = rateLimitRetryIntervalMs;
     }
 
     public void pollData(Integer batchSize) {
@@ -104,6 +109,10 @@ public class MilvusBufferReader {
                     completionSignal.countDown();
                     break;
                 } else {
+                    // Proactive rate limiting — throttle before processing the batch
+                    if (rateLimiter != null) {
+                        rateLimiter.accept(next.size());
+                    }
                     long currentOffset = (offset != null) ? offset : 0;
                     for (QueryResultsWrapper.RowRecord record : next) {
                         SeaTunnelRow seaTunnelRow = milvusSourceConverter.convertToSeaTunnelRow(record, tableSchema, collectionName, partitionName);
@@ -122,8 +131,11 @@ public class MilvusBufferReader {
                         throw new MilvusConnectorException(MilvusConnectionErrorCode.READ_DATA_FAIL,
                                 "Rate limit retries exhausted for collection: " + collectionName, e);
                     }
-                    log.warn("Rate limit exceeded. Retrying in {} ms. Retries left: {}", rateLimitRetryIntervalMs, maxFailRetry);
-                    Thread.sleep(rateLimitRetryIntervalMs);
+                    // Exponential backoff: 1s, 2s, 4s... capped at rateLimitRetryIntervalMs
+                    long backoff = Math.min(1000L << (3 - maxFailRetry), rateLimitRetryIntervalMs);
+                    log.warn("Rate limit exceeded for collection '{}'. Retrying in {}ms (retries left: {})",
+                            collectionName, backoff, maxFailRetry);
+                    Thread.sleep(backoff);
                 } else {
                     log.error("Query failed. Batch size: {}. Aborting...", batchSize, e);
                     throw new RuntimeException("Query failed", e);

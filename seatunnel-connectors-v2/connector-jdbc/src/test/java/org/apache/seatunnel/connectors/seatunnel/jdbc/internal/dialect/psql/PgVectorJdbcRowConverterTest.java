@@ -73,20 +73,20 @@ class PgVectorJdbcRowConverterTest {
                 buffer, statement, VectorType.VECTOR_FLOAT16_TYPE, 1, null);
 
         PGobject pgObject = capturePgObject(1);
-        assertEquals("halfvec", pgObject.getType());
+        assertEquals("vector", pgObject.getType());
         assertEquals("[1.5,2.0]", pgObject.getValue());
     }
 
     /** 1.5f as bfloat16 = upper 16 bits of 0x3FC00000 = 0x3FC0. */
     @Test
-    void testBfloat16VectorWritesHalfVec() throws Exception {
+    void testBfloat16VectorWritesVector() throws Exception {
         ByteBuffer buffer = fp16Buffer((short) 0x3FC0);
 
         converter.setValueToStatementByDataType(
                 buffer, statement, VectorType.VECTOR_BFLOAT16_TYPE, 1, null);
 
         PGobject pgObject = capturePgObject(1);
-        assertEquals("halfvec", pgObject.getType());
+        assertEquals("vector", pgObject.getType());
         assertEquals("[1.5]", pgObject.getValue());
     }
 
