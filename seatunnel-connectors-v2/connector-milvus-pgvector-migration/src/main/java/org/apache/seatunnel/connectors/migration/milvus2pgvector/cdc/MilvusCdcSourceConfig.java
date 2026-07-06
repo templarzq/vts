@@ -253,6 +253,15 @@ public class MilvusCdcSourceConfig implements Serializable {
      * CDC. When set, overrides the {@code GetReplicateInfo} bootstrap
      * checkpoint. Use only when you know the exact WAL position to resume from.
      */
+    public static final Option<String> SINK_JDBC_URL =
+            Options.key("sink_jdbc_url")
+                    .stringType()
+                    .noDefaultValue()
+                    .withDescription("Optional JDBC URL for auto-creating the pgvector target table "
+                            + "before snapshot. If set, the source will check if the target table "
+                            + "exists and create it from the Milvus collection schema if not. "
+                            + "Required for local mode (schema_save_mode only works in cluster).");
+
     public static final Option<String> CDC_START_MESSAGE_ID =
             Options.key("cdc_start_message_id")
                     .stringType()
@@ -293,6 +302,7 @@ public class MilvusCdcSourceConfig implements Serializable {
     private String cdcEtcdUsername;
     private String cdcEtcdPassword;
     private Boolean cdcAutoRecoverStalePosition;
+    private String sinkJdbcUrl;
 
     public static MilvusCdcSourceConfig of(ReadonlyConfig config) {
         return MilvusCdcSourceConfig.builder()
@@ -326,6 +336,7 @@ public class MilvusCdcSourceConfig implements Serializable {
                 .cdcEtcdUsername(config.get(CDC_ETCD_USERNAME))
                 .cdcEtcdPassword(config.get(CDC_ETCD_PASSWORD))
                 .cdcAutoRecoverStalePosition(config.get(CDC_AUTO_RECOVER_STALE_POSITION))
+                .sinkJdbcUrl(config.get(SINK_JDBC_URL))
                 .build();
     }
 

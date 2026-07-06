@@ -72,7 +72,14 @@ public class MilvusCdcSourceFactory implements ChangeStreamTableSourceFactory {
                         MilvusCdcSourceConfig.CDC_SOURCE_CLUSTER_ID,
                         MilvusCdcSourceConfig.CDC_START_MESSAGE_ID,
                         MilvusCdcSourceConfig.STREAMING_NODE_ADDRESS,
-                        MilvusCdcSourceConfig.CDC_USE_STREAMING_NODE)
+                        MilvusCdcSourceConfig.CDC_USE_STREAMING_NODE,
+                        MilvusCdcSourceConfig.SINK_JDBC_URL,
+                        MilvusCdcSourceConfig.CDC_ETCD_CA_PATH,
+                        MilvusCdcSourceConfig.CDC_ETCD_CLIENT_CERT_PATH,
+                        MilvusCdcSourceConfig.CDC_ETCD_CLIENT_KEY_PATH,
+                        MilvusCdcSourceConfig.CDC_ETCD_USERNAME,
+                        MilvusCdcSourceConfig.CDC_ETCD_PASSWORD,
+                        MilvusCdcSourceConfig.CDC_AUTO_RECOVER_STALE_POSITION)
                 .build();
     }
 

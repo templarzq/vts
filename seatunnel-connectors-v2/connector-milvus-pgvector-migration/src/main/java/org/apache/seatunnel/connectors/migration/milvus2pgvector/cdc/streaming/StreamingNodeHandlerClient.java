@@ -32,13 +32,16 @@ import org.apache.seatunnel.connectors.streaming.proto.StreamingNodeHandlerServi
 
 import com.google.protobuf.Empty;
 import com.google.protobuf.ByteString;
+import io.grpc.Grpc;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
 import io.grpc.Metadata;
+import io.grpc.TlsChannelCredentials;
 import io.grpc.stub.MetadataUtils;
 import io.grpc.stub.StreamObserver;
 import lombok.extern.slf4j.Slf4j;
 
+import java.io.File;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.util.Optional;
@@ -49,6 +52,9 @@ import java.util.concurrent.TimeUnit;
  * This client provides access to WAL messages via the {@code Consume} streaming RPC,
  * which is available in both standalone and replication topology modes (unlike
  * DumpMessages which only works in replication topology).
+ *
+ * <p>Supports TLS and mTLS via {@code ca_pem_path}, {@code client_pem_path},
+ * and {@code client_key_path} configuration options (since 2.3.11).
  */
 @Slf4j
 public class StreamingNodeHandlerClient implements AutoCloseable {
@@ -63,25 +69,38 @@ public class StreamingNodeHandlerClient implements AutoCloseable {
     private final long channelTimeoutMs;
 
     /**
-     * Constructor: creates a gRPC channel and stubs for the StreamingNode service.
+     * Constructor with full TLS/mTLS support.
      *
      * @param url              StreamingNode URL (e.g., "http://localhost:19531")
      * @param token            Authentication token (Bearer token)
      * @param channelTimeoutMs Timeout for unary RPCs in milliseconds
+     * @param caPemPath        CA certificate PEM file path (null/empty = system trust store)
+     * @param clientPemPath    Client certificate PEM file path for mTLS (null/empty = no mTLS)
+     * @param clientKeyPath    Client private key PEM file path for mTLS (null/empty = no mTLS)
+     * @param serverName       Server name override for TLS SNI / hostname verification
      */
-    public StreamingNodeHandlerClient(String url, String token, long channelTimeoutMs) {
+    public StreamingNodeHandlerClient(String url, String token, long channelTimeoutMs,
+                                       String caPemPath, String clientPemPath,
+                                       String clientKeyPath, String serverName) {
         this.channelTimeoutMs = channelTimeoutMs;
-        this.channel = buildChannel(url, token, channelTimeoutMs);
+        this.channel = buildChannel(url, token, channelTimeoutMs,
+                caPemPath, clientPemPath, clientKeyPath, serverName);
         this.asyncStub = StreamingNodeHandlerServiceGrpc.newStub(channel);
         this.blockingStub = StreamingNodeHandlerServiceGrpc.newBlockingStub(channel);
-        log.info("StreamingNodeHandlerClient initialized for URL: {}", url);
+        log.info("StreamingNodeHandlerClient initialized for URL: {} (tls={})",
+                url, SslUtil.hasTlsConfig(caPemPath, clientPemPath, clientKeyPath));
     }
 
     /**
-     * Build a gRPC ManagedChannel with Bearer token authentication.
-     * Handles various URL formats: "http://host:port", "host:port", "host" (default port 22222).
+     * Build a gRPC ManagedChannel with Bearer token authentication and optional TLS/mTLS.
+     * Handles various URL formats: "http://host:port", "https://host:port", "host:port", "host".
+     *
+     * <p>When TLS certificates are configured, the channel uses {@link TlsChannelCredentials}
+     * for secure transport; otherwise plaintext is used.
      */
-    private ManagedChannel buildChannel(String url, String token, long timeoutMs) {
+    private ManagedChannel buildChannel(String url, String token, long timeoutMs,
+                                         String caPemPath, String clientPemPath,
+                                         String clientKeyPath, String serverName) {
         String host;
         int port;
 
@@ -90,16 +109,14 @@ public class StreamingNodeHandlerClient implements AutoCloseable {
         }
 
         try {
-            // Handle URLs with or without scheme
             String parsedUrl = url;
             if (!parsedUrl.contains("://")) {
-                parsedUrl = "grpc://" + parsedUrl;  // Add dummy scheme for URI parsing
+                parsedUrl = "grpc://" + parsedUrl;
             }
             URI uri = new URI(parsedUrl);
             host = uri.getHost();
-            port = uri.getPort() > 0 ? uri.getPort() : 22222;  // Default StreamingNode port
+            port = uri.getPort() > 0 ? uri.getPort() : 22222;
         } catch (URISyntaxException e) {
-            // Fallback: try to parse as host:port directly
             String[] parts = url.split(":");
             host = parts[0];
             port = parts.length > 1 ? Integer.parseInt(parts[1]) : 22222;
@@ -111,14 +128,40 @@ public class StreamingNodeHandlerClient implements AutoCloseable {
 
         log.info("Building gRPC channel to StreamingNode at {}:{}", host, port);
 
-        ManagedChannelBuilder<?> builder = ManagedChannelBuilder.forAddress(host, port)
-                .usePlaintext()  // TODO: Support TLS
-                .keepAliveTime(timeoutMs, TimeUnit.MILLISECONDS);
+        ManagedChannelBuilder<?> builder;
 
-        // Add authorization metadata if token is provided
+        boolean hasTls = SslUtil.hasTlsConfig(caPemPath, clientPemPath, clientKeyPath);
+        if (hasTls) {
+            TlsChannelCredentials.Builder tlsBuilder = TlsChannelCredentials.newBuilder();
+            try {
+                if (SslUtil.hasCaConfig(caPemPath)) {
+                    tlsBuilder.trustManager(new File(caPemPath));
+                }
+                if (SslUtil.hasMtlsConfig(clientPemPath, clientKeyPath)) {
+                    tlsBuilder.keyManager(new File(clientPemPath), new File(clientKeyPath));
+                }
+            } catch (java.io.IOException e) {
+                throw new IllegalArgumentException(
+                        "Failed to load TLS certificate files for StreamingNode", e);
+            }
+            builder = Grpc.newChannelBuilder(host + ":" + port, tlsBuilder.build());
+            log.info("TLS enabled for StreamingNode channel (ca={}, mTLS={})",
+                    SslUtil.hasCaConfig(caPemPath),
+                    SslUtil.hasMtlsConfig(clientPemPath, clientKeyPath));
+        } else {
+            builder = ManagedChannelBuilder.forAddress(host, port).usePlaintext();
+        }
+
+        if (serverName != null && !serverName.isEmpty()) {
+            builder.overrideAuthority(serverName);
+        }
+
+        builder.keepAliveTime(timeoutMs, TimeUnit.MILLISECONDS);
+
         if (token != null && !token.isEmpty()) {
             Metadata metadata = new Metadata();
-            Metadata.Key<String> key = Metadata.Key.of(AUTHORIZATION_HEADER, Metadata.ASCII_STRING_MARSHALLER);
+            Metadata.Key<String> key =
+                    Metadata.Key.of(AUTHORIZATION_HEADER, Metadata.ASCII_STRING_MARSHALLER);
             metadata.put(key, BEARER_PREFIX + token);
             builder.intercept(MetadataUtils.newAttachHeadersInterceptor(metadata));
         }

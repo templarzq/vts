@@ -130,7 +130,7 @@ public class MilvusCdcStreamingNodeE2E extends MilvusCdcE2ETestBase {
                 .primaryKeyField("id")
                 .build();
 
-        return new CdcEventStreamStrategyV2(config, desc);
+        return new CdcEventStreamStrategyV2(config, desc, "");
     }
 
     /**
@@ -643,7 +643,7 @@ public class MilvusCdcStreamingNodeE2E extends MilvusCdcE2ETestBase {
                     .primaryKeyField("id")
                     .build();
 
-            try (CdcEventStreamStrategyV2 strategy = new CdcEventStreamStrategyV2(config, desc)) {
+            try (CdcEventStreamStrategyV2 strategy = new CdcEventStreamStrategyV2(config, desc, "")) {
                 boolean available = strategy.isAvailable();
                 assertFalse(available, "isAvailable should be false for invalid pchannel");
                 log.info("[{}] Invalid pchannel correctly returned isAvailable=false", scenarioName);

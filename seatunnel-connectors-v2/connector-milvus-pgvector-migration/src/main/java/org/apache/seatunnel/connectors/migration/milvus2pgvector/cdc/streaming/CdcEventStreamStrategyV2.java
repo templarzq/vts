@@ -94,7 +94,8 @@ public class CdcEventStreamStrategyV2 implements CdcStrategy {
      * @param collectionDesc collection schema description
      */
     public CdcEventStreamStrategyV2(
-            MilvusCdcSourceConfig config, DescribeCollectionResp collectionDesc) {
+            MilvusCdcSourceConfig config, DescribeCollectionResp collectionDesc,
+            String tableId) {
         this.pchannelName = config.getCdcPchannel();
         this.collectionId = collectionDesc.getCollectionID();
         // vchannel format: {pchannel}_{collectionID}v{shardIdx}
@@ -113,9 +114,14 @@ public class CdcEventStreamStrategyV2 implements CdcStrategy {
         this.streamingNodeClient = new StreamingNodeHandlerClient(
                 streamingNodeAddress,
                 config.getToken(),
-                config.getChannelTimeoutMs());
+                config.getChannelTimeoutMs(),
+                config.getCaPemPath(),
+                config.getClientPemPath(),
+                config.getClientKeyPath(),
+                config.getServerName());
 
         this.parser = new StreamingMessageParser(collectionDesc, config.getPrimaryKeyField());
+        this.parser.setTableId(tableId);
 
         // Initialize pchannel resolver for etcd-based auto-discovery
         this.pchannelResolver = new PChannelResolver(
@@ -127,8 +133,8 @@ public class CdcEventStreamStrategyV2 implements CdcStrategy {
                 config.getCdcEtcdUsername(),
                 config.getCdcEtcdPassword());
 
-        log.info("CdcEventStreamStrategyV2 initialized: pchannel={}, vchannel={}, collectionId={}, streamingNode={}",
-                pchannelName, vchannelName, collectionId, streamingNodeAddress);
+        log.info("CdcEventStreamStrategyV2 initialized: pchannel={}, vchannel={}, collectionId={}, tableId={}, streamingNode={}",
+                pchannelName, vchannelName, collectionId, tableId, streamingNodeAddress);
     }
 
     /**

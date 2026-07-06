@@ -26,6 +26,8 @@ import org.apache.seatunnel.api.table.catalog.TablePath;
 import org.apache.seatunnel.api.table.catalog.TableSchema;
 import org.apache.seatunnel.api.table.type.SeaTunnelRow;
 import org.apache.seatunnel.connectors.migration.milvus2pgvector.cdc.streaming.CdcEventStreamStrategyV2;
+import org.apache.seatunnel.connectors.migration.milvus2pgvector.cdc.streaming.CdcEventStreamStrategyV2;
+import org.apache.seatunnel.connectors.migration.milvus2pgvector.schema.AutoCreateTableHelper;
 import org.apache.seatunnel.connectors.seatunnel.milvus.sink.utils.MilvusConnectorUtils;
 import org.apache.seatunnel.connectors.seatunnel.milvus.source.MilvusBufferReader;
 import org.apache.seatunnel.connectors.seatunnel.milvus.source.MilvusSourceSplit;
@@ -101,6 +103,9 @@ public class MilvusCdcSourceReader implements SourceReader<SeaTunnelRow, MilvusC
                 DescribeCollectionReq.builder()
                         .collectionName(cdcConfig.getCollection())
                         .build());
+
+        // Auto-create target pgvector table from sink config if not exists
+        AutoCreateTableHelper.ensureTable(config, collectionDesc);
 
         // Initialize the CDC strategy
         this.cdcStrategy = createCdcStrategy();
@@ -312,13 +317,16 @@ public class MilvusCdcSourceReader implements SourceReader<SeaTunnelRow, MilvusC
      */
     private CdcStrategy createCdcStrategy() {
         String strategyType = cdcConfig.getCdcStrategy();
+        // Derive tableId from source table path (same format as snapshot phase),
+        // so that CDC DELETE rows match snapshot INSERT rows in sink-side buffers.
+        String tableId = sourceTables.keySet().iterator().next().toString();
 
         if ("event_stream".equalsIgnoreCase(strategyType)) {
             if (Boolean.TRUE.equals(cdcConfig.getCdcUseStreamingNode())) {
                 // V2 strategy: StreamingNode gRPC (works in standalone + cluster mode).
                 // cdc_pchannel is optional — auto-discovery from etcd + 0-15 scan.
                 CdcEventStreamStrategyV2 v2Strategy = new CdcEventStreamStrategyV2(
-                        cdcConfig, collectionDesc);
+                        cdcConfig, collectionDesc, tableId);
                 if (v2Strategy.isAvailable()) {
                     log.info("Using event_stream V2 CDC strategy via StreamingNode gRPC");
                     return v2Strategy;
@@ -343,4 +351,5 @@ public class MilvusCdcSourceReader implements SourceReader<SeaTunnelRow, MilvusC
         log.info("Using polling incremental CDC strategy");
         return new PollingIncrementalCdcStrategy(cdcConfig, converter, tableSchema);
     }
+
 }

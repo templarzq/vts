@@ -17,6 +17,8 @@
 
 package org.apache.seatunnel.connectors.migration.milvus2pgvector.transform;
 
+import lombok.extern.slf4j.Slf4j;
+
 import java.nio.ByteBuffer;
 import java.util.Map;
 import java.util.TreeMap;
@@ -30,6 +32,7 @@ import java.util.TreeMap;
  * org.apache.seatunnel.connectors.seatunnel.jdbc.internal.dialect.psql.PgVectorJdbcRowConverter}
  * but produces plain Java strings/arrays instead of PGobject instances.
  */
+@Slf4j
 public final class VectorFormatConverter {
 
     private VectorFormatConverter() {}
@@ -135,10 +138,29 @@ public final class VectorFormatConverter {
             if (i > 0) {
                 sb.append(",");
             }
-            sb.append(floats[i]);
+            float f = sanitizeFloat(floats[i], i);
+            sb.append(f);
         }
         sb.append("]");
         return sb.toString();
+    }
+
+    /**
+     * Sanitize a float value: replace NaN with 0.0f, +/-Infinity with +/-Float.MAX_VALUE,
+     * and log a warning for each replacement.
+     */
+    private static float sanitizeFloat(float f, int index) {
+        if (Float.isNaN(f)) {
+            log.warn("Float.NaN detected at vector index {}, replacing with 0.0f", index);
+            return 0.0f;
+        }
+        if (Float.isInfinite(f)) {
+            float replacement = f > 0 ? Float.MAX_VALUE : -Float.MAX_VALUE;
+            log.warn("Float.Infinity ({}) detected at vector index {}, replacing with {}",
+                    f, index, replacement);
+            return replacement;
+        }
+        return f;
     }
 
     // ---- bit-level decoders (same logic as PgVectorJdbcRowConverter) ----

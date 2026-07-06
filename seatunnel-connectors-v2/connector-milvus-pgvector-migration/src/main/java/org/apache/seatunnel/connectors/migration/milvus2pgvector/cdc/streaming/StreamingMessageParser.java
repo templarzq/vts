@@ -61,6 +61,7 @@ public class StreamingMessageParser {
 
     private final DescribeCollectionResp collectionDesc;
     private final String primaryKeyField;
+    private String tableId;
 
     // Message type key and values (from Milvus WAL properties)
     private static final String MSG_TYPE_KEY = "_t";
@@ -81,6 +82,15 @@ public class StreamingMessageParser {
     public StreamingMessageParser(DescribeCollectionResp collectionDesc, String primaryKeyField) {
         this.collectionDesc = collectionDesc;
         this.primaryKeyField = primaryKeyField;
+    }
+
+    /**
+     * Set the tableId to use for created SeaTunnelRow objects.
+     * Must be called before parsing messages; the tableId is needed so that sink-side
+     * buffer key matching can correlate CDC DELETE rows with snapshot INSERT rows.
+     */
+    public void setTableId(String tableId) {
+        this.tableId = tableId;
     }
 
     /**
@@ -192,6 +202,9 @@ public class StreamingMessageParser {
                         row.setField(fieldIdx, value);
                     }
                 }
+                if (tableId != null) {
+                    row.setTableId(tableId);
+                }
                 rows.add(row);
             }
 
@@ -231,6 +244,9 @@ public class StreamingMessageParser {
                         SeaTunnelRow row = new SeaTunnelRow(numFields);
                         row.setRowKind(RowKind.DELETE);
                         row.setField(0, pk);
+                        if (tableId != null) {
+                            row.setTableId(tableId);
+                        }
                         rows.add(row);
                     }
                     log.info("Parsed Delete: {} PKs (Int64 IDs), collection={}",
@@ -245,6 +261,9 @@ public class StreamingMessageParser {
                         SeaTunnelRow row = new SeaTunnelRow(numFields);
                         row.setRowKind(RowKind.DELETE);
                         row.setField(0, pk);
+                        if (tableId != null) {
+                            row.setTableId(tableId);
+                        }
                         rows.add(row);
                     }
                     log.info("Parsed Delete: {} PKs (VarChar IDs), collection={}",
@@ -260,6 +279,9 @@ public class StreamingMessageParser {
                     SeaTunnelRow row = new SeaTunnelRow(numFields);
                     row.setRowKind(RowKind.DELETE);
                     row.setField(0, pk);
+                    if (tableId != null) {
+                        row.setTableId(tableId);
+                    }
                     rows.add(row);
                 }
                 log.info("Parsed Delete: {} PKs (Int64 list), collection={}",

@@ -22,20 +22,11 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 
 import lombok.extern.slf4j.Slf4j;
 
-import javax.net.ssl.SSLContext;
-import javax.net.ssl.TrustManagerFactory;
-import javax.net.ssl.KeyManagerFactory;
-
-import java.io.FileInputStream;
-import java.io.InputStream;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.nio.file.Paths;
-import java.security.KeyStore;
 import java.time.Duration;
 import java.util.Base64;
 import java.util.Map;
@@ -245,98 +236,29 @@ public class PChannelResolver {
 
     // ---- TLS & Auth helpers ----
 
+    /**
+     * Build an HTTP client with optional TLS/mTLS via {@link SslUtil}.
+     *
+     * <p>Fix: when mTLS (client cert+key) is configured without a CA cert,
+     * the SSL context still uses the system trust store instead of being
+     * silently downgraded to plaintext.
+     */
     private static HttpClient buildHttpClient(String caPath, String clientCertPath,
                                                String clientKeyPath) {
         try {
             HttpClient.Builder builder = HttpClient.newBuilder()
                     .connectTimeout(Duration.ofSeconds(5));
 
-            if (caPath != null && !caPath.isEmpty()) {
-                SSLContext sslContext = createSslContext(caPath, clientCertPath, clientKeyPath);
+            if (SslUtil.hasTlsConfig(caPath, clientCertPath, clientKeyPath)) {
+                javax.net.ssl.SSLContext sslContext =
+                        SslUtil.createSslContext(caPath, clientCertPath, clientKeyPath);
                 builder.sslContext(sslContext);
-            } else if (clientCertPath != null || clientKeyPath != null) {
-                log.warn("Client cert/key provided without CA cert — TLS verification may fail");
             }
 
             return builder.build();
         } catch (Exception e) {
             log.error("Failed to build etcd HTTPS client: {}", e.getMessage());
             return HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build();
-        }
-    }
-
-    private static SSLContext createSslContext(String caPath, String clientCertPath,
-                                                String clientKeyPath) throws Exception {
-        // Load trust store from CA certificate
-        TrustManagerFactory tmf = null;
-        if (caPath != null && !caPath.isEmpty() && Files.exists(Paths.get(caPath))) {
-            KeyStore trustStore = KeyStore.getInstance(KeyStore.getDefaultType());
-            trustStore.load(null, null);
-            try (InputStream is = new FileInputStream(caPath)) {
-                java.security.cert.CertificateFactory cf =
-                        java.security.cert.CertificateFactory.getInstance("X.509");
-                java.security.cert.Certificate cert = cf.generateCertificate(is);
-                trustStore.setCertificateEntry("etcd-ca", cert);
-            }
-            tmf = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
-            tmf.init(trustStore);
-        }
-
-        // Load key store from client certificate + key (mTLS)
-        KeyManagerFactory kmf = null;
-        if (clientCertPath != null && !clientCertPath.isEmpty()
-                && clientKeyPath != null && !clientKeyPath.isEmpty()
-                && Files.exists(Paths.get(clientCertPath))
-                && Files.exists(Paths.get(clientKeyPath))) {
-            // Client cert loading requires PKCS12 keystore — simplified: load PEM directly
-            KeyStore keyStore = KeyStore.getInstance("PKCS12");
-            keyStore.load(null, null);
-
-            java.security.cert.CertificateFactory cf =
-                    java.security.cert.CertificateFactory.getInstance("X.509");
-            java.security.cert.Certificate cert;
-            try (InputStream is = new FileInputStream(clientCertPath)) {
-                cert = cf.generateCertificate(is);
-            }
-
-            java.security.PrivateKey privateKey = loadPrivateKey(clientKeyPath);
-            keyStore.setKeyEntry("etcd-client", privateKey, new char[0],
-                    new java.security.cert.Certificate[]{cert});
-
-            kmf = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());
-            kmf.init(keyStore, new char[0]);
-        }
-
-        SSLContext sslContext = SSLContext.getInstance("TLS");
-        sslContext.init(
-                kmf != null ? kmf.getKeyManagers() : null,
-                tmf != null ? tmf.getTrustManagers() : null,
-                null);
-        return sslContext;
-    }
-
-    /**
-     * Load a PEM-encoded RSA or EC private key.
-     */
-    private static java.security.PrivateKey loadPrivateKey(String keyPath) throws Exception {
-        String content = new String(Files.readAllBytes(Paths.get(keyPath)), StandardCharsets.UTF_8);
-        content = content.replace("-----BEGIN PRIVATE KEY-----", "")
-                .replace("-----END PRIVATE KEY-----", "")
-                .replace("-----BEGIN RSA PRIVATE KEY-----", "")
-                .replace("-----END RSA PRIVATE KEY-----", "")
-                .replace("-----BEGIN EC PRIVATE KEY-----", "")
-                .replace("-----END EC PRIVATE KEY-----", "")
-                .replaceAll("\\s", "");
-
-        byte[] keyBytes = Base64.getDecoder().decode(content);
-        java.security.spec.PKCS8EncodedKeySpec spec =
-                new java.security.spec.PKCS8EncodedKeySpec(keyBytes);
-        java.security.KeyFactory kf = java.security.KeyFactory.getInstance("RSA");
-        try {
-            return kf.generatePrivate(spec);
-        } catch (java.security.spec.InvalidKeySpecException e) {
-            kf = java.security.KeyFactory.getInstance("EC");
-            return kf.generatePrivate(spec);
         }
     }
 
