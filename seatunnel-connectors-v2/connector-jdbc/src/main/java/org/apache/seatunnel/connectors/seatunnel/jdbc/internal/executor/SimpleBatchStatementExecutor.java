@@ -23,13 +23,16 @@ import org.apache.seatunnel.connectors.seatunnel.jdbc.internal.converter.JdbcRow
 
 import lombok.NonNull;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 
 import javax.annotation.Nullable;
 
+import java.sql.BatchUpdateException;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.SQLException;
 
+@Slf4j
 @RequiredArgsConstructor
 public class SimpleBatchStatementExecutor implements JdbcBatchStatementExecutor<SeaTunnelRow> {
     @NonNull private final StatementFactory statementFactory;
@@ -37,6 +40,7 @@ public class SimpleBatchStatementExecutor implements JdbcBatchStatementExecutor<
     @Nullable private final TableSchema databaseTableSchema;
     @NonNull private final JdbcRowConverter converter;
     private transient PreparedStatement statement;
+    private int batchCount = 0;
 
     @Override
     public void prepareStatements(Connection connection) throws SQLException {
@@ -47,12 +51,20 @@ public class SimpleBatchStatementExecutor implements JdbcBatchStatementExecutor<
     public void addToBatch(SeaTunnelRow record) throws SQLException {
         converter.toExternal(tableSchema, databaseTableSchema, record, statement);
         statement.addBatch();
+        batchCount++;
     }
 
     @Override
     public void executeBatch() throws SQLException {
-        statement.executeBatch();
-        statement.clearBatch();
+        try {
+            statement.executeBatch();
+            statement.clearBatch();
+        } catch (BatchUpdateException e) {
+            log.error("Batch execution failed. Batch size: {}. Error: {}", batchCount, e.getMessage(), e);
+            throw e;
+        } finally {
+            batchCount = 0;
+        }
     }
 
     @Override

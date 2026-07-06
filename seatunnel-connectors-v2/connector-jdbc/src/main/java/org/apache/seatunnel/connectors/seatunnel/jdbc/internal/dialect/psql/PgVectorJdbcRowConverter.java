@@ -219,7 +219,7 @@ public class PgVectorJdbcRowConverter extends PostgresJdbcRowConverter {
             if (i > 0) {
                 sb.append(",");
             }
-            sb.append(floats[i]);
+            sb.append(sanitizeFloat(floats[i], i));
         }
         sb.append("]");
         return sb.toString();

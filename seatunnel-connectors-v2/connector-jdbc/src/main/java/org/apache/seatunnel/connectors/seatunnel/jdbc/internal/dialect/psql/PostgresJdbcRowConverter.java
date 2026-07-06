@@ -190,7 +190,8 @@ public class PostgresJdbcRowConverter extends AbstractJdbcRowConverter {
                 if (i > 0) {
                     vectorString.append(",");
                 }
-                vectorString.append(floatArray[i]);
+                float f = sanitizeFloat(floatArray[i], i);
+                vectorString.append(f);
             }
             vectorString.append("]");
             PGobject pgVector = new PGobject();
@@ -201,6 +202,23 @@ public class PostgresJdbcRowConverter extends AbstractJdbcRowConverter {
         }
         super.setValueToStatementByDataType(
                 value, statement, seaTunnelDataType, statementIndex, sourceType);
+    }
+
+    /**
+     * Replace NaN with 0.0f and +/-Infinity with +/-Float.MAX_VALUE.
+     * pgvector rejects NaN and Infinity in vector values.
+     */
+    protected static float sanitizeFloat(float f, int index) {
+        if (Float.isNaN(f)) {
+            log.warn("Float.NaN at dim[{}] replaced with 0.0f", index);
+            return 0.0f;
+        }
+        if (Float.isInfinite(f)) {
+            float replacement = f > 0 ? Float.MAX_VALUE : -Float.MAX_VALUE;
+            log.warn("Float.Infinity ({}) at dim[{}] replaced with {}", f, index, replacement);
+            return replacement;
+        }
+        return f;
     }
 
     private OffsetDateTime getPostgresOffsetDateTime(ResultSet rs, int columnIndex)
