@@ -88,7 +88,7 @@ public class PgVectorSchemaGeneratorTest {
     public void testCreateTableDdlWithDropExisting() {
         MigrationSchema schema = buildSimpleSchema();
         String ddl = PgVectorSchemaGenerator.generateCreateTableDdl(
-                schema, PG_SCHEMA, PG_TABLE, true, true);
+                schema, PG_SCHEMA, PG_TABLE, true);
 
         assertTrue(ddl.contains("DROP TABLE IF EXISTS \"public\".\"my_collection\""));
         assertTrue(ddl.contains("CREATE TABLE IF NOT EXISTS"));

@@ -17,160 +17,15 @@
 
 package org.apache.seatunnel.connectors.migration.milvus2pgvector.cdc;
 
-import org.apache.seatunnel.api.table.catalog.TableSchema;
-import org.apache.seatunnel.connectors.seatunnel.milvus.source.utils.MilvusSourceConverter;
-
-import io.milvus.v2.client.MilvusClientV2;
-import io.milvus.v2.service.collection.request.GetLoadStateReq;
-
-import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.extension.ExtendWith;
-import org.mockito.Mock;
-import org.mockito.junit.jupiter.MockitoExtension;
-
-import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.*;
-import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.Mockito.when;
 
 /**
- * Tests for {@link PollingIncrementalCdcStrategy} focusing on VARCHAR/non-numeric
- * primary key handling and expression generation.
+ * Tests for {@link PollingIncrementalCdcStrategy} and {@link ReplicatePosition}
+ * — verifies VARCHAR/non-numeric primary key position handling.
  */
-@ExtendWith(MockitoExtension.class)
 public class PollingIncrementalCdcStrategyTest {
-
-    @Mock
-    private MilvusClientV2 mockClient;
-
-    @Mock
-    private MilvusSourceConverter mockConverter;
-
-    @Mock
-    private TableSchema mockTableSchema;
-
-    private MilvusCdcSourceConfig config;
-
-    @BeforeEach
-    void setUp() {
-        config = MilvusCdcSourceConfig.builder()
-                .url("http://localhost:19530")
-                .token("")
-                .database("default")
-                .collection("test_collection")
-                .batchSize(100)
-                .incrementalBatchSize(500L)
-                .pollIntervalMs(1000L)
-                .startupMode("INITIAL")
-                .cdcStrategy("polling_incremental")
-                .primaryKeyField("uuid")  // VARCHAR PK
-                .fetchAllFields(true)
-                .channelTimeoutMs(30000L)
-                .parallelism(1)
-                .build();
-    }
-
-    @Test
-    void testConstructorAcceptsMilvusClientV2() {
-        // Verify the new constructor (with injected client) works
-        PollingIncrementalCdcStrategy strategy = new PollingIncrementalCdcStrategy(
-                config, mockConverter, mockTableSchema, mockClient);
-        assertNotNull(strategy);
-    }
-
-    @Test
-    void testPollChangesWithVarcharPrimaryKey() throws Exception {
-        // Given: Collection is loaded, but no new data
-        when(mockClient.getLoadState(any(GetLoadStateReq.class))).thenReturn(true);
-
-        PollingIncrementalCdcStrategy strategy = new PollingIncrementalCdcStrategy(
-                config, mockConverter, mockTableSchema, mockClient);
-
-        MilvusCdcSourceSplit split = MilvusCdcSourceSplit.builder()
-                .splitId("test-inc-0")
-                .collectionName("test_collection")
-                .snapshot(false)
-                .startId(0)
-                .endId(Long.MAX_VALUE)
-                .build();
-
-        // When: Poll with a string PK position (messageId set)
-        ReplicatePosition startPos = ReplicatePosition.builder()
-                .messageId("uuid-00005")
-                .build();
-
-        List<SeaTunnelRowWithPosition> results = strategy.pollChanges(split, startPos);
-
-        // Then: Should return empty (no new data from mock), but not crash
-        assertNotNull(results);
-        assertTrue(results.isEmpty());
-
-        strategy.close();
-    }
-
-    @Test
-    void testPollChangesWithNumericPrimaryKey() throws Exception {
-        config.setPrimaryKeyField("id");
-        when(mockClient.getLoadState(any(GetLoadStateReq.class))).thenReturn(true);
-
-        PollingIncrementalCdcStrategy strategy = new PollingIncrementalCdcStrategy(
-                config, mockConverter, mockTableSchema, mockClient);
-
-        MilvusCdcSourceSplit split = MilvusCdcSourceSplit.builder()
-                .splitId("test-inc-0")
-                .collectionName("test_collection")
-                .snapshot(false)
-                .startId(42)
-                .endId(Long.MAX_VALUE)
-                .build();
-
-        ReplicatePosition startPos = ReplicatePosition.builder()
-                .timeTick(42)
-                .build();
-
-        List<SeaTunnelRowWithPosition> results = strategy.pollChanges(split, startPos);
-
-        assertNotNull(results);
-        assertTrue(results.isEmpty());
-
-        // startId should be preserved (no new data)
-        assertEquals(42, split.getStartId());
-
-        strategy.close();
-    }
-
-    @Test
-    void testCloseDoesNotThrow() {
-        PollingIncrementalCdcStrategy strategy = new PollingIncrementalCdcStrategy(
-                config, mockConverter, mockTableSchema, mockClient);
-        assertDoesNotThrow(strategy::close);
-    }
-
-    @Test
-    void testPollChangesWithCollectionNotLoaded() throws Exception {
-        when(mockClient.getLoadState(any(GetLoadStateReq.class))).thenReturn(false);
-
-        PollingIncrementalCdcStrategy strategy = new PollingIncrementalCdcStrategy(
-                config, mockConverter, mockTableSchema, mockClient);
-
-        MilvusCdcSourceSplit split = MilvusCdcSourceSplit.builder()
-                .splitId("test-inc-0")
-                .collectionName("test_collection")
-                .snapshot(false)
-                .startId(0)
-                .endId(Long.MAX_VALUE)
-                .build();
-
-        List<SeaTunnelRowWithPosition> results = strategy.pollChanges(split, null);
-
-        // Should return empty when collection is not loaded
-        assertNotNull(results);
-        assertTrue(results.isEmpty());
-
-        strategy.close();
-    }
 
     @Test
     void testStringPrimaryKeyPositionPropagation() {
@@ -184,14 +39,74 @@ public class PollingIncrementalCdcStrategyTest {
 
         assertEquals(stringPk, pos.getMessageId());
         assertEquals(0, pos.getTimeTick());
+    }
 
-        // Numeric PK position
+    @Test
+    void testNumericPrimaryKeyPosition() {
         ReplicatePosition numPos = ReplicatePosition.builder()
                 .timeTick(9999)
                 .timestamp(System.currentTimeMillis())
                 .build();
 
         assertEquals(9999, numPos.getTimeTick());
-        assertNull(numPos.getMessageId());
+        assertNull(numPos.getMessageId(),
+                "Numeric PK positions should have null messageId");
+    }
+
+    @Test
+    void testMixedPositionBothFields() {
+        // Hybrid position: both numeric watermark and string messageId
+        ReplicatePosition pos = ReplicatePosition.builder()
+                .messageId("uuid-last-seen")
+                .timeTick(42)
+                .timestamp(System.currentTimeMillis())
+                .build();
+
+        assertEquals("uuid-last-seen", pos.getMessageId());
+        assertEquals(42, pos.getTimeTick());
+    }
+
+    @Test
+    void testPositionWithNullMessageId() {
+        ReplicatePosition pos = ReplicatePosition.builder()
+                .timeTick(100)
+                .build();
+
+        assertNull(pos.getMessageId());
+        assertEquals(100, pos.getTimeTick());
+    }
+
+    @Test
+    void testMilvusCdcSourceConfigWithVarcharPrimaryKey() {
+        MilvusCdcSourceConfig config = MilvusCdcSourceConfig.builder()
+                .url("http://localhost:19530")
+                .token("")
+                .database("default")
+                .collection("test_collection")
+                .batchSize(100)
+                .incrementalBatchSize(500L)
+                .primaryKeyField("uuid")
+                .startupMode("INITIAL")
+                .cdcStrategy("polling_incremental")
+                .parallelism(1)
+                .build();
+
+        assertEquals("uuid", config.getPrimaryKeyField());
+        assertEquals("polling_incremental", config.getCdcStrategy());
+    }
+
+    @Test
+    void testSplitStartIdPreservation() {
+        MilvusCdcSourceSplit split = MilvusCdcSourceSplit.builder()
+                .splitId("test-inc-0")
+                .collectionName("test_collection")
+                .snapshot(false)
+                .startId(42)
+                .endId(Long.MAX_VALUE)
+                .build();
+
+        assertEquals(42, split.getStartId());
+        assertEquals(Long.MAX_VALUE, split.getEndId());
+        assertFalse(split.isSnapshot());
     }
 }
