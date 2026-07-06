@@ -38,6 +38,7 @@ public class MilvusToPgVectorTransformFactory implements TableTransformFactory {
     @Override
     public OptionRule optionRule() {
         return OptionRule.builder()
+                .optional(MilvusToPgVectorTransformConfig.PG_DATABASE)
                 .optional(MilvusToPgVectorTransformConfig.PG_SCHEMA)
                 .optional(MilvusToPgVectorTransformConfig.PG_TABLE)
                 .optional(TransformCommonOptions.MULTI_TABLES)

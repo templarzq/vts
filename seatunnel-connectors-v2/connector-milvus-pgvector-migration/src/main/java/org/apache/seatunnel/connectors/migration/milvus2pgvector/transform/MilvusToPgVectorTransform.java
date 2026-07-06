@@ -61,9 +61,13 @@ public class MilvusToPgVectorTransform extends AbstractCatalogSupportMapTransfor
                 config.getPgTable() != null && !config.getPgTable().isEmpty()
                         ? config.getPgTable()
                         : inputCatalogTable.getTableId().getTableName();
+        String pgDatabase =
+                config.getPgDatabase() != null && !config.getPgDatabase().isEmpty()
+                        ? config.getPgDatabase()
+                        : inputCatalogTable.getTableId().getDatabaseName();
         return TableIdentifier.of(
                 "pgvector",
-                inputCatalogTable.getTableId().getDatabaseName(),
+                pgDatabase,
                 config.getPgSchema(),
                 tableName);
     }

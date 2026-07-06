@@ -97,6 +97,7 @@ public class MilvusConnectorUtils {
             connectConfig.setClientKeyPath(config.get(MilvusCommonConfig.CLIENT_KEY_PATH));
         }
         if(config.get(MilvusCommonConfig.CA_PEM_PATH) != null){
+            connectConfig.setServerPemPath(config.get(MilvusCommonConfig.CA_PEM_PATH));
             connectConfig.setCaPemPath(config.get(MilvusCommonConfig.CA_PEM_PATH));
         }
         if(config.get(MilvusCommonConfig.SERVER_NAME) != null){

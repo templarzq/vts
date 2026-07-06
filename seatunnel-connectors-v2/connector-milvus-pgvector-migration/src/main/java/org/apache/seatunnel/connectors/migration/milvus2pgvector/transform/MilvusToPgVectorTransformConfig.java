@@ -32,6 +32,13 @@ public class MilvusToPgVectorTransformConfig implements Serializable {
 
     private static final long serialVersionUID = 1L;
 
+    public static final Option<String> PG_DATABASE =
+            Options.key("pg_database")
+                    .stringType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "pgvector target database name; defaults to the upstream database name");
+
     public static final Option<String> PG_SCHEMA =
             Options.key("pg_schema")
                     .stringType()
@@ -45,11 +52,13 @@ public class MilvusToPgVectorTransformConfig implements Serializable {
                     .withDescription(
                             "pgvector target table name; defaults to the Milvus collection name");
 
+    private String pgDatabase;
     private String pgSchema;
     private String pgTable;
 
     public static MilvusToPgVectorTransformConfig of(ReadonlyConfig config) {
         MilvusToPgVectorTransformConfig c = new MilvusToPgVectorTransformConfig();
+        c.setPgDatabase(config.get(PG_DATABASE));
         c.setPgSchema(config.get(PG_SCHEMA));
         c.setPgTable(config.get(PG_TABLE));
         return c;

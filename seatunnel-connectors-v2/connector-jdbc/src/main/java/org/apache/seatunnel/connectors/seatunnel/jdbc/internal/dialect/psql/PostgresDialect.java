@@ -195,8 +195,10 @@ public class PostgresDialect implements JdbcDialect {
 
     @Override
     public String tableIdentifier(String database, String tableName) {
-        // resolve pg database name upper or lower not recognised
-        return quoteDatabaseIdentifier(database) + "." + quoteIdentifier(tableName);
+        // PostgreSQL doesn't use database-qualified table names in SQL;
+        // the database is already selected by the JDBC connection.
+        // The tableName may already include schema prefix (e.g., "public.table").
+        return quoteIdentifier(tableName);
     }
 
     @Override
@@ -218,7 +220,8 @@ public class PostgresDialect implements JdbcDialect {
 
     @Override
     public String tableIdentifier(TablePath tablePath) {
-        return tablePath.getFullNameWithQuoted("\"");
+        // PostgreSQL uses schema.table, not database.schema.table
+        return tablePath.getSchemaAndTableName("\"");
     }
 
     @Override
