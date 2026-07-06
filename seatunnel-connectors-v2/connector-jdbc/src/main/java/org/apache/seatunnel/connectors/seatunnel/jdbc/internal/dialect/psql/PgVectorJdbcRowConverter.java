@@ -35,7 +35,7 @@ import java.util.TreeMap;
  *
  * <ul>
  *   <li>{@code vector} — from FLOAT_VECTOR (handled by parent)
- *   <li>{@code halfvec} — from FLOAT16_VECTOR / BFLOAT16_VECTOR (bf16 loses precision)
+ *   <li>{@code vector} — from FLOAT16_VECTOR / BFLOAT16_VECTOR (lossless, stored as float32)
  *   <li>{@code bit} — from BINARY_VECTOR
  *   <li>{@code sparsevec} — from SPARSE_FLOAT_VECTOR
  * </ul>
@@ -61,13 +61,10 @@ public class PgVectorJdbcRowConverter extends PostgresJdbcRowConverter {
         SqlType sqlType = seaTunnelDataType.getSqlType();
         switch (sqlType) {
             case FLOAT16_VECTOR:
-                writeHalfVec((ByteBuffer) value, statement, statementIndex);
+                writeVector((ByteBuffer) value, statement, statementIndex, false);
                 return;
             case BFLOAT16_VECTOR:
-                log.warn(
-                        "Writing BFLOAT16_VECTOR to halfvec may lose precision "
-                                + "(bfloat16 has 7 mantissa bits vs halfvec's 10).");
-                writeBfloat16AsHalfVec((ByteBuffer) value, statement, statementIndex);
+                writeVector((ByteBuffer) value, statement, statementIndex, true);
                 return;
             case BINARY_VECTOR:
                 writeBit((ByteBuffer) value, statement, statementIndex);
@@ -84,29 +81,20 @@ public class PgVectorJdbcRowConverter extends PostgresJdbcRowConverter {
         }
     }
 
-    /** pgvector {@code halfvec} expects the same {@code [v1,v2,...]} text form as {@code vector}. */
-    private void writeHalfVec(ByteBuffer buffer, PreparedStatement statement, int index)
-            throws SQLException {
-        if (buffer == null) {
-            statement.setNull(index, java.sql.Types.OTHER);
-            return;
-        }
-        float[] floats = decodeFloat16(buffer);
-        statement.setObject(index, buildPgObject("halfvec", floatsToBracketString(floats)));
-    }
-
     /**
-     * BFloat16 (Brain Float) — 1 sign + 8 exponent + 7 mantissa. We convert to float32 then write
-     * as halfvec. Precision is lost because halfvec stores 16-bit float (5 exponent + 10 mantissa).
+     * Write a Float16 or BFloat16 vector as pgvector {@code vector} (float32).
+     * Both Float16 and BFloat16 are strict subsets of float32 — this conversion is lossless.
+     *
+     * @param isBfloat16 true for BFloat16 decoding, false for IEEE 754 binary16
      */
-    private void writeBfloat16AsHalfVec(ByteBuffer buffer, PreparedStatement statement, int index)
-            throws SQLException {
+    private void writeVector(ByteBuffer buffer, PreparedStatement statement, int index,
+                             boolean isBfloat16) throws SQLException {
         if (buffer == null) {
             statement.setNull(index, java.sql.Types.OTHER);
             return;
         }
-        float[] floats = decodeBfloat16(buffer);
-        statement.setObject(index, buildPgObject("halfvec", floatsToBracketString(floats)));
+        float[] floats = isBfloat16 ? decodeBfloat16(buffer) : decodeFloat16(buffer);
+        statement.setObject(index, buildPgObject("vector", floatsToBracketString(floats)));
     }
 
     /** pgvector {@code bit} accepts a textual 0/1 string like {@code "10110010"}. */

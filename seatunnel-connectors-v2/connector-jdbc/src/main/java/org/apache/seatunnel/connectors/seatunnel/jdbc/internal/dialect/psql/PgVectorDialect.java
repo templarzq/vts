@@ -23,7 +23,7 @@ import org.apache.seatunnel.connectors.seatunnel.jdbc.internal.converter.JdbcRow
  * PostgreSQL dialect extension for pgvector. Activated via {@code compatible_mode = "pgvector"}.
  *
  * <p>Delegates all standard PostgreSQL behavior to {@link PostgresDialect}; only the row converter
- * is replaced with {@link PgVectorJdbcRowConverter} to support writing {@code halfvec}, {@code bit},
+ * is replaced with {@link PgVectorJdbcRowConverter} to support writing {@code vector}, {@code bit},
  * and {@code sparsevec} columns in addition to the base {@code vector} type.
  */
 public class PgVectorDialect extends PostgresDialect {
