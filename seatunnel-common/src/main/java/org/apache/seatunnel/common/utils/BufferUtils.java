@@ -75,10 +75,15 @@ public class BufferUtils {
     }
 
     public static Float[] toFloatArray(ByteBuffer byteBuffer) {
-        Float[] floatArray = new Float[byteBuffer.capacity() / 4];
+        // Reset position to 0 to ensure we read from the beginning,
+        // regardless of prior partial reads on this buffer.
+        ByteBuffer buf = byteBuffer.duplicate();
+        ((java.nio.Buffer) buf).rewind();
+
+        Float[] floatArray = new Float[buf.capacity() / 4];
 
         for (int i = 0; i < floatArray.length; i++) {
-            floatArray[i] = byteBuffer.getFloat();
+            floatArray[i] = buf.getFloat();
         }
 
         return floatArray;

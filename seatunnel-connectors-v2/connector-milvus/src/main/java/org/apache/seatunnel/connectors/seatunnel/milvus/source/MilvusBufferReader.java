@@ -15,6 +15,8 @@ import org.apache.seatunnel.connectors.seatunnel.milvus.exception.MilvusConnecti
 import org.apache.seatunnel.connectors.seatunnel.milvus.exception.MilvusConnectorException;
 import org.apache.seatunnel.connectors.seatunnel.milvus.source.utils.MilvusSourceConverter;
 
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
@@ -102,10 +104,13 @@ public class MilvusBufferReader {
                     completionSignal.countDown();
                     break;
                 } else {
+                    long currentOffset = (offset != null) ? offset : 0;
                     for (QueryResultsWrapper.RowRecord record : next) {
                         SeaTunnelRow seaTunnelRow = milvusSourceConverter.convertToSeaTunnelRow(record, tableSchema, collectionName, partitionName);
+                        validateVectorFields(seaTunnelRow, collectionName, partitionName, currentOffset);
                         seaTunnelRow.setTableId(split.getTablePath().toString());
                         output.collect(seaTunnelRow);
+                        currentOffset++;
                     }
                     // Reset retry counter on successful batch
                     maxFailRetry = 3;
@@ -127,5 +132,98 @@ public class MilvusBufferReader {
         }
 
         log.info("Query execution completed for collection '{}'", collectionName);
+    }
+
+    /**
+     * Validate and sanitize vector field values in a SeaTunnelRow.
+     * Replaces NaN → 0.0f, +Infinity → Float.MAX_VALUE, -Infinity → -Float.MAX_VALUE
+     * in ByteBuffer-backed float vectors, which are the canonical vector format from Milvus.
+     * pgvector rejects NaN and Infinity, so we must sanitize at the source.
+     */
+    private void validateVectorFields(SeaTunnelRow row, String collection, String partition,
+                                       long rowOffset) {
+        Object[] fields = row.getFields();
+        if (fields == null) {
+            return;
+        }
+        for (int fieldIdx = 0; fieldIdx < fields.length; fieldIdx++) {
+            sanitizeVectorField(fields, fieldIdx, collection, partition, rowOffset);
+        }
+    }
+
+    /**
+     * Check a single field for NaN/Infinity float values and sanitize in place.
+     * Handles ByteBuffer (Milvus native vector format), List&lt;Float&gt;, and float[].
+     */
+    @SuppressWarnings("unchecked")
+    private void sanitizeVectorField(Object[] fields, int fieldIdx, String collection,
+                                      String partition, long rowOffset) {
+        Object field = fields[fieldIdx];
+        if (field instanceof ByteBuffer) {
+            // Milvus native vector format: little-endian float ByteBuffer.
+            // Use capacity() instead of remaining() because the buffer position
+            // may have been advanced by downstream converters before reaching us.
+            ByteBuffer buf = (ByteBuffer) field;
+            int floatCount = buf.capacity() / Float.BYTES;
+            boolean modified = false;
+            // Read/write at absolute positions via a duplicate so we don't
+            // disturb the original buffer's position/limit.
+            ByteBuffer dup = buf.duplicate();
+            dup.order(ByteOrder.LITTLE_ENDIAN);
+            for (int i = 0; i < floatCount; i++) {
+                float f = dup.getFloat(i * Float.BYTES);
+                if (Float.isNaN(f)) {
+                    dup.putFloat(i * Float.BYTES, 0.0f);
+                    modified = true;
+                    log.warn("Float.NaN replaced with 0.0f in vector field[{}], dim[{}], "
+                            + "row offset={} (collection={}, partition={})",
+                            fieldIdx, i, rowOffset, collection, partition);
+                } else if (Float.isInfinite(f)) {
+                    float replacement = f > 0 ? Float.MAX_VALUE : -Float.MAX_VALUE;
+                    dup.putFloat(i * Float.BYTES, replacement);
+                    modified = true;
+                    log.warn("Float.Infinity ({}) replaced with {} in vector field[{}], dim[{}], "
+                            + "row offset={} (collection={}, partition={})",
+                            f, replacement, fieldIdx, i, rowOffset, collection, partition);
+                }
+            }
+            if (modified) {
+                // Update the original buffer with sanitized data
+                buf.rewind();
+                dup.rewind();
+                buf.put(dup);
+                buf.rewind();
+            }
+        } else if (field instanceof List) {
+            List<?> list = (List<?>) field;
+            for (Object item : list) {
+                if (item instanceof Float) {
+                    float f = (Float) item;
+                    if (Float.isNaN(f) || Float.isInfinite(f)) {
+                        log.warn("Invalid float value ({}) in vector field[{}] at row offset {} "
+                                        + "(collection={}, partition={})",
+                                f, fieldIdx, rowOffset, collection, partition);
+                        break;
+                    }
+                }
+            }
+        } else if (field instanceof float[]) {
+            float[] arr = (float[]) field;
+            for (int i = 0; i < arr.length; i++) {
+                float f = arr[i];
+                if (Float.isNaN(f)) {
+                    arr[i] = 0.0f;
+                    log.warn("Float.NaN replaced with 0.0f in vector field[{}], dim[{}], "
+                            + "row offset={} (collection={}, partition={})",
+                            fieldIdx, i, rowOffset, collection, partition);
+                } else if (Float.isInfinite(f)) {
+                    float replacement = f > 0 ? Float.MAX_VALUE : -Float.MAX_VALUE;
+                    arr[i] = replacement;
+                    log.warn("Float.Infinity ({}) replaced with {} in vector field[{}], dim[{}], "
+                            + "row offset={} (collection={}, partition={})",
+                            f, replacement, fieldIdx, i, rowOffset, collection, partition);
+                }
+            }
+        }
     }
 }
