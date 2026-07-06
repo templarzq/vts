@@ -31,7 +31,7 @@
 
     <properties>
         <postgresql.version>42.4.3</postgresql.version>
-        <testcontainer.milvus.version>1.19.8</testcontainer.milvus.version>
+        <testcontainer.milvus.version>1.20.6</testcontainer.milvus.version>
     </properties>
 
     <dependencies>
@@ -93,13 +93,6 @@
             <groupId>org.testcontainers</groupId>
             <artifactId>testcontainers</artifactId>
             <version>${testcontainer.milvus.version}</version>
-            <scope>test</scope>
-        </dependency>
-        <!-- Override docker-java transport for Docker API >= 1.44 (Docker 26+) -->
-        <dependency>
-            <groupId>com.github.docker-java</groupId>
-            <artifactId>docker-java-transport-httpclient5</artifactId>
-            <version>3.4.1</version>
             <scope>test</scope>
         </dependency>
         <dependency>
