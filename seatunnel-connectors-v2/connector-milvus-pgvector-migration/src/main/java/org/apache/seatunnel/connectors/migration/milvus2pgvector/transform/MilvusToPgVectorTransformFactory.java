@@ -40,7 +40,6 @@ public class MilvusToPgVectorTransformFactory implements TableTransformFactory {
         return OptionRule.builder()
                 .optional(MilvusToPgVectorTransformConfig.PG_SCHEMA)
                 .optional(MilvusToPgVectorTransformConfig.PG_TABLE)
-                .optional(MilvusToPgVectorTransformConfig.ALLOW_PRECISION_LOSS)
                 .optional(TransformCommonOptions.MULTI_TABLES)
                 .optional(TransformCommonOptions.TABLE_MATCH_REGEX)
                 .build();

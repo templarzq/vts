@@ -45,22 +45,13 @@ public class MilvusToPgVectorTransformConfig implements Serializable {
                     .withDescription(
                             "pgvector target table name; defaults to the Milvus collection name");
 
-    public static final Option<Boolean> ALLOW_PRECISION_LOSS =
-            Options.key("allow_precision_loss")
-                    .booleanType()
-                    .defaultValue(true)
-                    .withDescription(
-                            "Allow BFloat16 → halfvec precision loss. If false, throws on BFloat16 columns.");
-
     private String pgSchema;
     private String pgTable;
-    private boolean allowPrecisionLoss;
 
     public static MilvusToPgVectorTransformConfig of(ReadonlyConfig config) {
         MilvusToPgVectorTransformConfig c = new MilvusToPgVectorTransformConfig();
         c.setPgSchema(config.get(PG_SCHEMA));
         c.setPgTable(config.get(PG_TABLE));
-        c.setAllowPrecisionLoss(config.get(ALLOW_PRECISION_LOSS));
         return c;
     }
 }

@@ -27,10 +27,15 @@ import org.apache.seatunnel.connectors.migration.milvus2pgvector.schema.SchemaMi
 import org.apache.seatunnel.connectors.migration.milvus2pgvector.validation.DataValidator;
 import org.apache.seatunnel.connectors.migration.milvus2pgvector.validation.ValidationReport;
 
+import io.milvus.v2.client.ConnectConfig;
+import io.milvus.v2.client.MilvusClientV2;
+
 import lombok.extern.slf4j.Slf4j;
 
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * Orchestrates the three migration phases: schema → data → validation.
@@ -132,21 +137,26 @@ public class MigrationOrchestrator {
                         throw new IllegalStateException(
                                 "SeaTunnelJobSubmitter is required for data migration phase");
                     }
-                    int exitCode = jobSubmitter.submitAndWait(config, logger);
-                    if (exitCode != 0) {
-                        throw new RuntimeException(
-                                "SeaTunnel job exited with code " + exitCode);
+                    List<String> collections = resolveCollections();
+                    if (collections.size() > 1) {
+                        logger.info(String.format("Migrating %d collections in parallel", collections.size()));
+                        dataResult = migrateMultipleCollections(collections);
+                    } else {
+                        int exitCode = jobSubmitter.submitAndWait(config, logger);
+                        if (exitCode != 0) {
+                            throw new RuntimeException(
+                                    "SeaTunnel job exited with code " + exitCode);
+                        }
+                        dataResult = "SUCCESS";
                     }
                     tracker.markPhaseComplete(MigrationProgressTracker.Phase.DATA);
                     logger.logPhase("DATA", "COMPLETED");
-                    dataResult = "SUCCESS";
                 } catch (Exception e) {
                     tracker.markPhaseFailed(MigrationProgressTracker.Phase.DATA);
                     logger.logPhase("DATA", "FAILED");
                     logger.error("Data migration failed", e);
                     dataResult = "FAILED: " + e.getMessage();
                     overallSuccess = false;
-                    // Continue to validation if schema succeeded (best-effort)
                 }
             }
         }
@@ -184,6 +194,110 @@ public class MigrationOrchestrator {
         logger.logPhase("MIGRATION", overallSuccess ? "COMPLETED" : "COMPLETED WITH ERRORS");
         return buildReport(
                 startTime, schemaResult, dataResult, validationReport, overallSuccess);
+    }
+
+    /**
+     * Discover all collection names from Milvus. Used when the collection config is
+     * {@code *} or a comma-separated list for parallel per-collection job submission.
+     */
+    private List<String> resolveCollections() {
+        String col = config.getMilvusCollection();
+        if (col == null || col.isEmpty() || "*".equals(col)) {
+            // Discover all collections from Milvus
+            List<String> names = new ArrayList<>();
+            try {
+                ConnectConfig cc = ConnectConfig.builder()
+                        .uri(config.getMilvusUrl())
+                        .token(config.getMilvusToken())
+                        .build();
+                MilvusClientV2 client = new MilvusClientV2(cc);
+                try {
+                    io.milvus.v2.service.collection.response.ListCollectionsResp resp =
+                            client.listCollections();
+                    if (resp != null && resp.getCollectionNames() != null) {
+                        names.addAll(resp.getCollectionNames());
+                    }
+                } finally {
+                    client.close();
+                }
+                logger.info(String.format("Discovered %d collections from Milvus: %s",
+                        names.size(), names));
+            } catch (Exception e) {
+                throw new RuntimeException("Failed to discover collections from Milvus", e);
+            }
+            return names;
+        }
+        // Single collection (possibly comma-separated)
+        if (col.contains(",")) {
+            List<String> names = new ArrayList<>();
+            for (String part : col.split(",")) {
+                String trimmed = part.trim();
+                if (!trimmed.isEmpty()) names.add(trimmed);
+            }
+            return names;
+        }
+        return java.util.Collections.singletonList(col);
+    }
+
+    /** Submit one SeaTunnel job per collection and wait for all to complete. */
+    private String migrateMultipleCollections(List<String> collections) {
+        List<String> failures = new ArrayList<>();
+        java.util.concurrent.ExecutorService executor =
+                java.util.concurrent.Executors.newFixedThreadPool(
+                        Math.min(collections.size(), config.getParallelism()));
+        try {
+            java.util.List<java.util.concurrent.Future<String>> futures = new ArrayList<>();
+            for (String collection : collections) {
+                futures.add(executor.submit(() -> {
+                    logger.info(String.format("Starting migration for collection: %s", collection));
+                    MigrationConfig perCollectionConfig = MigrationConfig.builder()
+                            .milvusUrl(config.getMilvusUrl())
+                            .milvusToken(config.getMilvusToken())
+                            .milvusDatabase(config.getMilvusDatabase())
+                            .milvusCollection(collection)
+                            .pgUrl(config.getPgUrl())
+                            .pgUser(config.getPgUser())
+                            .pgPassword(config.getPgPassword())
+                            .pgSchema(config.getPgSchema())
+                            .pgTable(collection) // map Milvus collection to pg table of same name
+                            .batchSize(config.getBatchSize())
+                            .parallelism(1) // single reader per collection when parallelized
+                            .rateLimitRowsPerSecond(config.getRateLimitRowsPerSecond())
+                            .skipIndexMigration(config.isSkipIndexMigration())
+                            .dropExistingTable(config.isDropExistingTable())
+                            .validationSampleSize(config.getValidationSampleSize())
+                            .passRateThreshold(config.getPassRateThreshold())
+                            .auditLogDir(config.getAuditLogDir())
+                            .build();
+                    try {
+                        int exitCode = jobSubmitter.submitAndWait(perCollectionConfig, logger);
+                        if (exitCode != 0) {
+                            return "FAILED: " + collection + " (exit " + exitCode + ")";
+                        }
+                        return "OK: " + collection;
+                    } catch (Exception e) {
+                        return "FAILED: " + collection + " (" + e.getMessage() + ")";
+                    }
+                }));
+            }
+            for (java.util.concurrent.Future<String> f : futures) {
+                try {
+                    String result = f.get();
+                    if (result.startsWith("FAILED")) {
+                        failures.add(result);
+                    }
+                    logger.info(String.format("Collection migration result: %s", result));
+                } catch (Exception e) {
+                    failures.add("FAILED: " + e.getMessage());
+                }
+            }
+        } finally {
+            executor.shutdownNow();
+        }
+        if (!failures.isEmpty()) {
+            throw new RuntimeException("Multi-collection migration had failures: " + failures);
+        }
+        return "SUCCESS (" + collections.size() + " collections)";
     }
 
     /** Introspect Milvus schema without executing DDL (for resume/validation-only scenarios). */

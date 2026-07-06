@@ -45,8 +45,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *   <li><b>Delete detection limitation</b> — documents a known limitation: the
  *       {@link PollingIncrementalCdcStrategy} uses PK-based filtering ({@code id > watermark}),
  *       which cannot detect deletions. The test records this as an anomaly in the report for
- *       problem analysis. To capture deletes, the {@link GrpcReplicateCdcStrategy} or a separate
- *       tombstone mechanism is required.
+ *       problem analysis. To capture deletes, the {@link org.apache.seatunnel.connectors.migration.milvus2pgvector.cdc.streaming.CdcEventStreamStrategyV2}
+ *       or a separate tombstone mechanism is required.
  *   <li><b>Mixed workload</b> — interleaved insert + update + delete operations.
  * </ol>
  *
@@ -226,7 +226,7 @@ public class MilvusCdcIncrementalE2E extends MilvusCdcE2ETestBase {
                 // Record the change-detection method as an anomaly for problem analysis
                 metrics.recordAnomaly(scenarioName, "UPDATE_DETECTION_METHOD",
                         "PK-polling cannot detect same-PK updates; re-scan required. "
-                                + "Use GrpcReplicateCdcStrategy for true CDC update capture.");
+                                + "Use CdcEventStreamStrategyV2 for true CDC update capture.");
 
                 // 7. Verify similarity on updated rows
                 verifyVectorSimilarity(scenarioName, collectionName, tableName, VECTOR_DIM,
@@ -305,7 +305,7 @@ public class MilvusCdcIncrementalE2E extends MilvusCdcE2ETestBase {
                 metrics.recordAnomaly(scenarioName, "DELETE_NOT_DETECTED",
                         "PollingIncrementalCdcStrategy does not capture deletes. "
                                 + DELETE_COUNT + " rows deleted from Milvus but pgvector unchanged. "
-                                + "Use GrpcReplicateCdcStrategy or external tombstone mechanism "
+                                + "Use CdcEventStreamStrategyV2 or external tombstone mechanism "
                                 + "for delete propagation.");
             } finally {
                 dropPgTable(tableName);

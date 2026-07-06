@@ -76,7 +76,7 @@ public final class VectorFormatConverter {
         return out;
     }
 
-    /** Convert a FLOAT16 or BFLOAT16 float[] to pgvector halfvec {@code [v1,v2,...]}. */
+    /** Convert a FLOAT16 or BFLOAT16 float[] to pgvector {@code [v1,v2,...]} (stored as float32 vector). */
     public static String floatsToHalfVecString(float[] floats) {
         return floatsToBracketString(floats);
     }

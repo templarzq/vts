@@ -38,7 +38,7 @@ public final class PgVectorSchemaGenerator {
 
     /** Generate the CREATE TABLE DDL with optional DROP TABLE prefix. */
     public static String generateCreateTableDdl(
-            MigrationSchema schema, String pgSchema, String pgTable, boolean dropExisting, boolean allowPrecisionLoss) {
+            MigrationSchema schema, String pgSchema, String pgTable, boolean dropExisting) {
         StringBuilder sb = new StringBuilder();
         if (dropExisting) {
             sb.append("DROP TABLE IF EXISTS ").append(quoteQualified(pgSchema, pgTable)).append(";\n");
@@ -46,7 +46,7 @@ public final class PgVectorSchemaGenerator {
         sb.append("CREATE TABLE IF NOT EXISTS ").append(quoteQualified(pgSchema, pgTable)).append(" (\n");
         List<String> columnDefs = new ArrayList<>();
         for (MigrationSchema.ColumnDef col : schema.getColumns()) {
-            columnDefs.add("    " + quoteIdent(col.getName()) + " " + toPgType(col, allowPrecisionLoss));
+            columnDefs.add("    " + quoteIdent(col.getName()) + " " + toPgType(col));
         }
         if (schema.getPrimaryKeyName() != null) {
             columnDefs.add("    PRIMARY KEY (" + quoteIdent(schema.getPrimaryKeyName()) + ")");
@@ -78,7 +78,7 @@ public final class PgVectorSchemaGenerator {
     }
 
     /** Map a single Milvus column definition to its pgvector column type string. */
-    static String toPgType(MigrationSchema.ColumnDef col, boolean allowPrecisionLoss) {
+    static String toPgType(MigrationSchema.ColumnDef col) {
         DataType type = col.getDataType();
         if (type == null) {
             throw new IllegalArgumentException("Column " + col.getName() + " has null dataType");
@@ -93,7 +93,7 @@ public final class PgVectorSchemaGenerator {
             case BFloat16Vector:
             case BinaryVector:
             case SparseFloatVector:
-                return TypeMapping.mapVector(type, col.getDimension(), allowPrecisionLoss);
+                return TypeMapping.mapVector(type, col.getDimension());
             case Bool:
             case Int8:
             case Int16:

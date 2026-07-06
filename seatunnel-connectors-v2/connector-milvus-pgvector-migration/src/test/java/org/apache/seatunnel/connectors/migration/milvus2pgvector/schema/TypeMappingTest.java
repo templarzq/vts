@@ -119,65 +119,56 @@ public class TypeMappingTest {
 
     @Test
     public void testFloatVectorMapping() {
-        assertEquals("vector(128)", TypeMapping.mapVector(DataType.FloatVector, 128, true));
+        assertEquals("vector(128)", TypeMapping.mapVector(DataType.FloatVector, 128));
     }
 
     @Test
     public void testFloat16VectorMapping() {
-        assertEquals("halfvec(64)", TypeMapping.mapVector(DataType.Float16Vector, 64, true));
+        assertEquals("vector(64)", TypeMapping.mapVector(DataType.Float16Vector, 64));
     }
 
     @Test
-    public void testBFloat16VectorMappingWithPrecisionLoss() {
-        assertEquals("halfvec(32)", TypeMapping.mapVector(DataType.BFloat16Vector, 32, true));
-    }
-
-    @Test
-    public void testBFloat16VectorMappingWithoutPrecisionLossThrows() {
-        MigrationException ex =
-                assertThrows(
-                        MigrationException.class,
-                        () -> TypeMapping.mapVector(DataType.BFloat16Vector, 32, false));
-        assertTrue(ex.getMessage().contains("BFloat16Vector"));
+    public void testBFloat16VectorMapping() {
+        assertEquals("vector(32)", TypeMapping.mapVector(DataType.BFloat16Vector, 32));
     }
 
     @Test
     public void testBinaryVectorMapping() {
-        assertEquals("bit(256)", TypeMapping.mapVector(DataType.BinaryVector, 256, true));
+        assertEquals("bit(256)", TypeMapping.mapVector(DataType.BinaryVector, 256));
     }
 
     @Test
     public void testSparseFloatVectorMappingIgnoresDimension() {
-        assertEquals("sparsevec", TypeMapping.mapVector(DataType.SparseFloatVector, null, true));
-        assertEquals("sparsevec", TypeMapping.mapVector(DataType.SparseFloatVector, 0, true));
+        assertEquals("sparsevec", TypeMapping.mapVector(DataType.SparseFloatVector, null));
+        assertEquals("sparsevec", TypeMapping.mapVector(DataType.SparseFloatVector, 0));
     }
 
     @Test
     public void testVectorWithNullDimensionThrows() {
         assertThrows(
                 MigrationException.class,
-                () -> TypeMapping.mapVector(DataType.FloatVector, null, true));
+                () -> TypeMapping.mapVector(DataType.FloatVector, null));
     }
 
     @Test
     public void testVectorWithZeroDimensionThrows() {
         assertThrows(
                 MigrationException.class,
-                () -> TypeMapping.mapVector(DataType.FloatVector, 0, true));
+                () -> TypeMapping.mapVector(DataType.FloatVector, 0));
     }
 
     @Test
     public void testVectorWithNegativeDimensionThrows() {
         assertThrows(
                 MigrationException.class,
-                () -> TypeMapping.mapVector(DataType.FloatVector, -1, true));
+                () -> TypeMapping.mapVector(DataType.FloatVector, -1));
     }
 
     @Test
     public void testMapVectorThrowsForScalarType() {
         assertThrows(
                 MigrationException.class,
-                () -> TypeMapping.mapVector(DataType.Int64, 10, true));
+                () -> TypeMapping.mapVector(DataType.Int64, 10));
     }
 
     // ---- array types ----

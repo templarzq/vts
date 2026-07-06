@@ -83,7 +83,7 @@ public final class AutoCreateTableHelper {
 
             MigrationSchema migrationSchema = buildSchema(collectionDesc);
             String ddl = PgVectorSchemaGenerator.generateCreateTableDdl(
-                    migrationSchema, schema, table, false, true);
+                    migrationSchema, schema, table, false);
             log.info("Auto-creating target table:\n{}", ddl);
             try (Statement stmt = conn.createStatement()) {
                 stmt.execute(ddl);

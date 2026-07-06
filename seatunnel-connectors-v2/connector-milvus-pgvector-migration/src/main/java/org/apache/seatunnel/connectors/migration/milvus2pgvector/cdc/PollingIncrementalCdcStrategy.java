@@ -24,7 +24,6 @@ import org.apache.seatunnel.connectors.seatunnel.milvus.source.utils.MilvusSourc
 
 import io.milvus.orm.iterator.QueryIterator;
 import io.milvus.response.QueryResultsWrapper;
-import io.milvus.v2.client.ConnectConfig;
 import io.milvus.v2.client.MilvusClientV2;
 import io.milvus.v2.service.collection.request.GetLoadStateReq;
 import io.milvus.v2.service.vector.request.QueryIteratorReq;
@@ -52,36 +51,14 @@ public class PollingIncrementalCdcStrategy implements CdcStrategy {
     public PollingIncrementalCdcStrategy(
             MilvusCdcSourceConfig config,
             MilvusSourceConverter converter,
-            TableSchema tableSchema) {
+            TableSchema tableSchema,
+            MilvusClientV2 client) {
         this.config = config;
         this.converter = converter;
         this.tableSchema = tableSchema;
         this.collectionName = config.getCollection();
         this.primaryKeyField = config.getPrimaryKeyField();
-
-        ConnectConfig connectConfig = ConnectConfig.builder()
-                .uri(config.getUrl())
-                .token(config.getToken())
-                .dbName(config.getDatabase())
-                .connectTimeoutMs(config.getChannelTimeoutMs())
-                .build();
-        applyTlsConfig(connectConfig);
-        this.client = new MilvusClientV2(connectConfig);
-    }
-
-    private void applyTlsConfig(ConnectConfig connectConfig) {
-        if (config.getClientPemPath() != null) {
-            connectConfig.setClientPemPath(config.getClientPemPath());
-        }
-        if (config.getClientKeyPath() != null) {
-            connectConfig.setClientKeyPath(config.getClientKeyPath());
-        }
-        if (config.getCaPemPath() != null) {
-            connectConfig.setCaPemPath(config.getCaPemPath());
-        }
-        if (config.getServerName() != null) {
-            connectConfig.setServerName(config.getServerName());
-        }
+        this.client = client;
     }
 
     @Override
@@ -95,12 +72,30 @@ public class PollingIncrementalCdcStrategy implements CdcStrategy {
             return Collections.emptyList();
         }
 
-        long watermark = split.getStartId();
-        if (startPosition != null && startPosition.getTimeTick() > 0) {
-            watermark = Math.max(watermark, startPosition.getTimeTick());
+        // Determine the watermark — support both numeric and string PKs.
+        // Numeric PK: watermark stored in startPosition.timeTick and split.startId.
+        // String PK:  watermark stored in startPosition.messageId.
+        long numWatermark = split.getStartId();
+        String strWatermark = null;
+        if (startPosition != null) {
+            if (startPosition.getTimeTick() > 0) {
+                numWatermark = Math.max(numWatermark, startPosition.getTimeTick());
+            }
+            if (startPosition.getMessageId() != null && !startPosition.getMessageId().isEmpty()) {
+                strWatermark = startPosition.getMessageId();
+            }
         }
 
-        String expr = primaryKeyField + " > " + watermark;
+        // Build the filter expression based on the watermark type
+        String expr;
+        boolean isStringPk = strWatermark != null;
+        if (isStringPk) {
+            // String PK: use string comparison
+            expr = primaryKeyField + " > '" + strWatermark.replace("'", "\\'") + "'";
+        } else {
+            // Numeric PK: use numeric comparison
+            expr = primaryKeyField + " > " + numWatermark;
+        }
 
         QueryIteratorReq queryReq = QueryIteratorReq.builder()
                 .collectionName(collectionName)
@@ -110,7 +105,8 @@ public class PollingIncrementalCdcStrategy implements CdcStrategy {
                 .build();
 
         List<SeaTunnelRowWithPosition> results = new ArrayList<>();
-        long maxSeenId = watermark;
+        long maxSeenNumId = numWatermark;
+        String maxSeenStrId = strWatermark;
         long pollTime = System.currentTimeMillis();
         QueryIterator iterator = null;
 
@@ -124,16 +120,23 @@ public class PollingIncrementalCdcStrategy implements CdcStrategy {
                     row.setRowKind(RowKind.INSERT);
                     row.setTableId(collectionName);
 
-                    results.add(new SeaTunnelRowWithPosition(row,
-                            ReplicatePosition.builder()
-                                    .timeTick(maxSeenId)
-                                    .timestamp(pollTime)
-                                    .build()));
-
                     Object idValue = record.get(primaryKeyField);
+                    ReplicatePosition pos = ReplicatePosition.builder()
+                            .timeTick(maxSeenNumId)
+                            .timestamp(pollTime)
+                            .build();
                     if (idValue instanceof Number) {
-                        maxSeenId = Math.max(maxSeenId, ((Number) idValue).longValue());
+                        maxSeenNumId = Math.max(maxSeenNumId, ((Number) idValue).longValue());
+                        pos.setTimeTick(maxSeenNumId);
+                    } else if (idValue != null) {
+                        // String/VARCHAR PK: track the maximum string value
+                        String idStr = idValue.toString();
+                        if (maxSeenStrId == null || idStr.compareTo(maxSeenStrId) > 0) {
+                            maxSeenStrId = idStr;
+                        }
+                        pos.setMessageId(maxSeenStrId);
                     }
+                    results.add(new SeaTunnelRowWithPosition(row, pos));
                 }
 
                 if (results.size() >= config.getIncrementalBatchSize()) {
@@ -150,7 +153,7 @@ public class PollingIncrementalCdcStrategy implements CdcStrategy {
             }
         }
 
-        split.setStartId(maxSeenId);
+        split.setStartId(maxSeenNumId);
         return results;
     }
 

@@ -97,8 +97,7 @@ public class SchemaMigrator implements AutoCloseable {
                                 schema,
                                 config.getPgSchema(),
                                 config.getPgTable(),
-                                config.isDropExistingTable(),
-                                config.isAllowPrecisionLoss());
+                                config.isDropExistingTable());
                 log.info("Executing CREATE TABLE DDL:\n{}", createTableDdl);
                 for (String sql : createTableDdl.split(";")) {
                     String trimmed = sql.trim();

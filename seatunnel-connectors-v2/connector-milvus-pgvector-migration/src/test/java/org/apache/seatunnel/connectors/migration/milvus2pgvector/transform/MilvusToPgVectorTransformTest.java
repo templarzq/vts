@@ -25,8 +25,6 @@ import org.apache.seatunnel.api.table.catalog.TableSchema;
 import org.apache.seatunnel.api.table.type.BasicType;
 import org.apache.seatunnel.api.table.type.SeaTunnelRow;
 import org.apache.seatunnel.api.table.type.VectorType;
-import org.apache.seatunnel.connectors.migration.milvus2pgvector.exception.MigrationException;
-
 import org.junit.jupiter.api.Test;
 
 import java.nio.ByteBuffer;
@@ -47,11 +45,10 @@ public class MilvusToPgVectorTransformTest {
                 id, schema, Collections.emptyMap(), Collections.emptyList(), "test table");
     }
 
-    private static MilvusToPgVectorTransformConfig config(String pgSchema, String pgTable, boolean allowLoss) {
+    private static MilvusToPgVectorTransformConfig config(String pgSchema, String pgTable) {
         MilvusToPgVectorTransformConfig c = new MilvusToPgVectorTransformConfig();
         c.setPgSchema(pgSchema);
         c.setPgTable(pgTable);
-        c.setAllowPrecisionLoss(allowLoss);
         return c;
     }
 
@@ -70,7 +67,7 @@ public class MilvusToPgVectorTransformTest {
                                 "vector"));
         MilvusToPgVectorTransform transform =
                 new MilvusToPgVectorTransform(
-                        config("public", "target_table", true), input);
+                        config("public", "target_table"), input);
 
         CatalogTable produced = transform.getProducedCatalogTable();
         TableIdentifier outId = produced.getTableId();
@@ -87,7 +84,7 @@ public class MilvusToPgVectorTransformTest {
                         PhysicalColumn.of(
                                 "id", BasicType.LONG_TYPE, 0L, false, null, "pk"));
         MilvusToPgVectorTransform transform =
-                new MilvusToPgVectorTransform(config("public", null, true), input);
+                new MilvusToPgVectorTransform(config("public", null), input);
 
         CatalogTable produced = transform.getProducedCatalogTable();
         assertEquals("my_collection", produced.getTableId().getTableName());
@@ -100,7 +97,7 @@ public class MilvusToPgVectorTransformTest {
                         PhysicalColumn.of(
                                 "id", BasicType.LONG_TYPE, 0L, false, null, "pk"));
         MilvusToPgVectorTransform transform =
-                new MilvusToPgVectorTransform(config("myschema", "", true), input);
+                new MilvusToPgVectorTransform(config("myschema", ""), input);
 
         CatalogTable produced = transform.getProducedCatalogTable();
         assertEquals("myschema", produced.getTableId().getSchemaName());
@@ -121,7 +118,7 @@ public class MilvusToPgVectorTransformTest {
                                 null,
                                 "vector"));
         MilvusToPgVectorTransform transform =
-                new MilvusToPgVectorTransform(config("public", "t", true), input);
+                new MilvusToPgVectorTransform(config("public", "t"), input);
         // Force produced catalog table initialization (needed before map() is callable)
         transform.getProducedCatalogTable();
 
@@ -136,7 +133,7 @@ public class MilvusToPgVectorTransformTest {
     }
 
     @Test
-    public void testBFloat16ThrowsWhenPrecisionLossNotAllowed() {
+    public void testBFloat16Accepted() {
         CatalogTable input =
                 buildCatalogTable(
                         PhysicalColumn.of(
@@ -149,35 +146,14 @@ public class MilvusToPgVectorTransformTest {
                                 null,
                                 "bfloat16 vector"));
         MilvusToPgVectorTransform transform =
-                new MilvusToPgVectorTransform(config("public", "t", false), input);
-        assertThrows(
-                MigrationException.class,
-                transform::getProducedCatalogTable,
-                "BFloat16 column with allowPrecisionLoss=false should throw");
-    }
-
-    @Test
-    public void testBFloat16AllowedWhenPrecisionLossPermitted() {
-        CatalogTable input =
-                buildCatalogTable(
-                        PhysicalColumn.of(
-                                "id", BasicType.LONG_TYPE, 0L, false, null, "pk"),
-                        PhysicalColumn.of(
-                                "embedding",
-                                VectorType.VECTOR_BFLOAT16_TYPE,
-                                4L,
-                                false,
-                                null,
-                                "bfloat16 vector"));
-        MilvusToPgVectorTransform transform =
-                new MilvusToPgVectorTransform(config("public", "t", true), input);
-        // Should not throw
+                new MilvusToPgVectorTransform(config("public", "t"), input);
+        // BFloat16 → vector(float32) is lossless, should always succeed
         CatalogTable produced = transform.getProducedCatalogTable();
         assertEquals("t", produced.getTableId().getTableName());
     }
 
     @Test
-    public void testFloat16AllowedRegardlessOfPrecisionLossFlag() {
+    public void testFloat16Accepted() {
         CatalogTable input =
                 buildCatalogTable(
                         PhysicalColumn.of(
@@ -190,8 +166,8 @@ public class MilvusToPgVectorTransformTest {
                                 null,
                                 "float16 vector"));
         MilvusToPgVectorTransform transform =
-                new MilvusToPgVectorTransform(config("public", "t", false), input);
-        // Float16 → halfvec is lossless, so allowPrecisionLoss=false should NOT throw
+                new MilvusToPgVectorTransform(config("public", "t"), input);
+        // FP16 → vector(float32) is lossless, should always succeed
         CatalogTable produced = transform.getProducedCatalogTable();
         assertEquals("t", produced.getTableId().getTableName());
     }
@@ -212,7 +188,7 @@ public class MilvusToPgVectorTransformTest {
                         PhysicalColumn.of(
                                 "meta", BasicType.STRING_TYPE, 0L, true, null, "metadata"));
         MilvusToPgVectorTransform transform =
-                new MilvusToPgVectorTransform(config("public", "t", true), input);
+                new MilvusToPgVectorTransform(config("public", "t"), input);
 
         CatalogTable produced = transform.getProducedCatalogTable();
         // Schema should be preserved (same columns, same types)

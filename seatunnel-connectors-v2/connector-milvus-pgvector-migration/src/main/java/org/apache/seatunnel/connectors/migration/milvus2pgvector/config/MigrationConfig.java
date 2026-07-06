@@ -54,12 +54,11 @@ public class MigrationConfig {
     @Builder.Default private boolean skipIndexMigration = false;
     /** Drop target table before migration if it exists. */
     @Builder.Default private boolean dropExistingTable = false;
-    /** Allow BFloat16 → halfvec precision loss. */
-    @Builder.Default private boolean allowPrecisionLoss = true;
 
     // ---- validation ----
     @Builder.Default private int validationSampleSize = 100;
-    @Builder.Default private double similarityThreshold = 0.9999;
+    /** Minimum pass rate for field-level comparison validation (0.0–1.0). */
+    @Builder.Default private double passRateThreshold = 0.99;
 
     // ---- audit ----
     /** Directory to write migration logs and progress state. */

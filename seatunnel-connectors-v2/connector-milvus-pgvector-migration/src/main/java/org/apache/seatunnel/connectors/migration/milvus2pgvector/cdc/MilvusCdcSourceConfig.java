@@ -116,7 +116,7 @@ public class MilvusCdcSourceConfig implements Serializable {
     public static final Option<Boolean> CDC_USE_STREAMING_NODE =
             Options.key("cdc_use_streaming_node")
                     .booleanType()
-                    .defaultValue(false)
+                    .defaultValue(true)
                     .withDescription(
                             "Use StreamingNode gRPC for event_stream strategy (recommended). "
                                     + "If true, uses StreamingNodeHandlerService.Consume; "
@@ -253,6 +253,13 @@ public class MilvusCdcSourceConfig implements Serializable {
      * CDC. When set, overrides the {@code GetReplicateInfo} bootstrap
      * checkpoint. Use only when you know the exact WAL position to resume from.
      */
+    /** Max rows per second for data migration; <= 0 means unlimited. */
+    public static final Option<Integer> CDC_RATE_LIMIT_ROWS_PER_SECOND =
+            Options.key("cdc_rate_limit_rows_per_second")
+                    .intType()
+                    .defaultValue(0)
+                    .withDescription("Max rows per second during CDC migration; 0 = unlimited");
+
     public static final Option<String> SINK_JDBC_URL =
             Options.key("sink_jdbc_url")
                     .stringType()
@@ -302,6 +309,7 @@ public class MilvusCdcSourceConfig implements Serializable {
     private String cdcEtcdUsername;
     private String cdcEtcdPassword;
     private Boolean cdcAutoRecoverStalePosition;
+    private Integer cdcRateLimitRowsPerSecond;
     private String sinkJdbcUrl;
 
     public static MilvusCdcSourceConfig of(ReadonlyConfig config) {
@@ -336,6 +344,7 @@ public class MilvusCdcSourceConfig implements Serializable {
                 .cdcEtcdUsername(config.get(CDC_ETCD_USERNAME))
                 .cdcEtcdPassword(config.get(CDC_ETCD_PASSWORD))
                 .cdcAutoRecoverStalePosition(config.get(CDC_AUTO_RECOVER_STALE_POSITION))
+                .cdcRateLimitRowsPerSecond(config.get(CDC_RATE_LIMIT_ROWS_PER_SECOND))
                 .sinkJdbcUrl(config.get(SINK_JDBC_URL))
                 .build();
     }

@@ -56,7 +56,6 @@ public class MigrationCliArgs {
     // ---- behavior ----
     private boolean skipIndexMigration = false;
     private boolean dropExistingTable = false;
-    private boolean noPrecisionLoss = false;
 
     // ---- phase control ----
     private boolean validateOnly = false;
@@ -66,7 +65,7 @@ public class MigrationCliArgs {
 
     // ---- validation ----
     private int sampleSize = 100;
-    private double similarityThreshold = 0.9999;
+    private double passRateThreshold = 0.99;
 
     // ---- audit ----
     private String logDir = "./migration-logs";
@@ -86,7 +85,6 @@ public class MigrationCliArgs {
     static {
         FLAGS.put("--skip-index-migration", "skipIndexMigration");
         FLAGS.put("--drop-existing-table", "dropExistingTable");
-        FLAGS.put("--no-precision-loss", "noPrecisionLoss");
         FLAGS.put("--validate-only", "validateOnly");
         FLAGS.put("--schema-only", "schemaOnly");
         FLAGS.put("--data-only", "dataOnly");
@@ -157,8 +155,8 @@ public class MigrationCliArgs {
                 case "--sample-size":
                     cli.sampleSize = parseInt(arg, value, 100);
                     break;
-                case "--similarity-threshold":
-                    cli.similarityThreshold = parseDouble(arg, value, 0.9999);
+                case "--pass-rate-threshold":
+                    cli.passRateThreshold = parseDouble(arg, value, 0.99);
                     break;
                 case "--seatunnel-home":
                     cli.seatunnelHome = value;
@@ -325,9 +323,8 @@ public class MigrationCliArgs {
                 .rateLimitRowsPerSecond(rateLimit)
                 .skipIndexMigration(skipIndexMigration)
                 .dropExistingTable(dropExistingTable)
-                .allowPrecisionLoss(!noPrecisionLoss)
                 .validationSampleSize(sampleSize)
-                .similarityThreshold(similarityThreshold)
+                .passRateThreshold(passRateThreshold)
                 .auditLogDir(logDir)
                 .build();
     }
@@ -365,14 +362,13 @@ public class MigrationCliArgs {
                 + "  --rate-limit <rows/s>         Max rows per second, 0=unlimited (default: 0)\n"
                 + "  --skip-index-migration        Skip creating vector indexes on pgvector\n"
                 + "  --drop-existing-table         Drop target table before migration\n"
-                + "  --no-precision-loss           Forbid BFloat16 → halfvec precision loss\n"
                 + "  --validate-only               Only run validation (skip schema + data)\n"
                 + "  --schema-only                 Only run schema migration\n"
                 + "  --data-only                   Only run data migration\n"
                 + "  --resume                      Resume from last checkpoint (skip completed phases)\n"
                 + "  --log-dir <dir>               Log/audit directory (default: ./migration-logs)\n"
                 + "  --sample-size <n>             Validation sample size (default: 100)\n"
-                + "  --similarity-threshold <d>    Cosine similarity threshold (default: 0.9999)\n"
+                + "  --pass-rate-threshold <d>     Min pass rate for field comparison (default: 0.99)\n"
                 + "  --seatunnel-home <dir>        SeaTunnel install dir (default: $SEATUNNEL_HOME)\n"
                 + "  --config <file>               Properties config file (CLI args override)\n"
                 + "  --help                        Print this help message\n";

@@ -26,7 +26,6 @@ public enum MigrationErrorCode implements SeaTunnelErrorCode {
     DDL_EXECUTION_FAILED("MIGRATE-04", "Failed to execute DDL on pgvector"),
     VALIDATION_FAILED("MIGRATE-05", "Data validation failed after migration"),
     VALIDATION_QUERY_FAILED("MIGRATE-06", "Failed to query during validation"),
-    PRECISION_LOSS_NOT_ALLOWED("MIGRATE-07", "Precision-lossy type conversion not allowed by config"),
     RATE_LIMIT_EXCEEDED("MIGRATE-08", "Rate limit wait timed out"),
     MIGRATION_CONFIG_INVALID("MIGRATE-09", "Invalid migration configuration"),
     MIGRATION_ORCHESTRATION_FAILED("MIGRATE-10", "Migration orchestration step failed"),

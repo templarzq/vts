@@ -223,9 +223,8 @@ public abstract class MilvusPgVectorTestBase {
                 .rateLimitRowsPerSecond(0)
                 .skipIndexMigration(false)
                 .dropExistingTable(true)
-                .allowPrecisionLoss(true)
                 .validationSampleSize(50)
-                .similarityThreshold(0.999)
+                .passRateThreshold(0.99)
                 .auditLogDir(java.nio.file.Paths.get("target/migration-logs").toString())
                 .build();
     }

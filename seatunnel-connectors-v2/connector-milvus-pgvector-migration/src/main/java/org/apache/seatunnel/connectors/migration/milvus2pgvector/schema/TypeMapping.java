@@ -30,9 +30,8 @@ import org.apache.seatunnel.connectors.migration.milvus2pgvector.exception.Migra
  *
  * <ul>
  *   <li>{@link DataType#FloatVector} → {@code vector(N)}
- *   <li>{@link DataType#Float16Vector} → {@code halfvec(N)}
- *   <li>{@link DataType#BFloat16Vector} → {@code halfvec(N)} (loses precision; caller decides
- *       whether to allow)
+ *   <li>{@link DataType#Float16Vector} → {@code vector(N)} (lossless, stored as float32)
+ *   <li>{@link DataType#BFloat16Vector} → {@code vector(N)} (lossless, stored as float32)
  *   <li>{@link DataType#BinaryVector} → {@code bit(N)}
  *   <li>{@link DataType#SparseFloatVector} → {@code sparsevec}
  * </ul>
@@ -85,33 +84,20 @@ public final class TypeMapping {
 
     /**
      * Map a Milvus vector DataType to a pgvector vector column type with dimension.
+     * All vector types are stored as {@code vector(N)} (float32) for zero precision loss
+     * — BFloat16 and FP16 are strict subsets of float32 and can be represented exactly.
      *
      * @param type must be one of FloatVector, Float16Vector, BFloat16Vector, BinaryVector,
      *     SparseFloatVector
      * @param dimension vector dimension; ignored for SparseFloatVector
-     * @param allowBfloat16PrecisionLoss if false, BFLOAT16_VECTOR throws {@link
-     *     MigrationErrorCode#PRECISION_LOSS_NOT_ALLOWED}
      */
-    public static String mapVector(DataType type, Integer dimension, boolean allowBfloat16PrecisionLoss) {
+    public static String mapVector(DataType type, Integer dimension) {
         switch (type) {
             case FloatVector:
-                requireDimension(type, dimension);
-                return "vector(" + dimension + ")";
             case Float16Vector:
-                requireDimension(type, dimension);
-                return "halfvec(" + dimension + ")";
             case BFloat16Vector:
                 requireDimension(type, dimension);
-                if (!allowBfloat16PrecisionLoss) {
-                    throw new MigrationException(
-                            MigrationErrorCode.PRECISION_LOSS_NOT_ALLOWED,
-                            "BFloat16Vector → halfvec loses precision; "
-                                    + "set allowPrecisionLoss=true to override");
-                }
-                log.warn(
-                        "Mapping BFloat16Vector to halfvec loses precision "
-                                + "(bfloat16: 8-bit exp + 7-bit mantissa, halfvec: 5-bit exp + 10-bit mantissa).");
-                return "halfvec(" + dimension + ")";
+                return "vector(" + dimension + ")";
             case BinaryVector:
                 requireDimension(type, dimension);
                 return "bit(" + dimension + ")";

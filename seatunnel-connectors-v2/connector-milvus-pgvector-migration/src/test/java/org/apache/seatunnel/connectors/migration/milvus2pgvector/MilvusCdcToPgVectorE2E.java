@@ -356,7 +356,7 @@ public class MilvusCdcToPgVectorE2E {
 
         // Create CDC strategy for snapshot (PK-based polling from beginning)
         PollingIncrementalCdcStrategy strategy =
-                new PollingIncrementalCdcStrategy(cdcConfig, converter, tableSchema);
+                new PollingIncrementalCdcStrategy(cdcConfig, converter, tableSchema, milvusClient);
 
         // Create a snapshot split (startId=-1 so first query includes id=0)
         MilvusCdcSourceSplit snapshotSplit = MilvusCdcSourceSplit.builder()
@@ -471,7 +471,7 @@ public class MilvusCdcToPgVectorE2E {
 
         // Create incremental split starting from the last snapshot ID
         PollingIncrementalCdcStrategy strategy =
-                new PollingIncrementalCdcStrategy(cdcConfig, converter, tableSchema);
+                new PollingIncrementalCdcStrategy(cdcConfig, converter, tableSchema, milvusClient);
 
         MilvusCdcSourceSplit incSplit = MilvusCdcSourceSplit.builder()
                 .splitId("e2e-inc-0")

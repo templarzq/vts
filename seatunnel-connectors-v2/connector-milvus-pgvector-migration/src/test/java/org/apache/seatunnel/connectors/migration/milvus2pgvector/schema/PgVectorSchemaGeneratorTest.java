@@ -73,7 +73,7 @@ public class PgVectorSchemaGeneratorTest {
     public void testCreateTableDdlBasic() {
         MigrationSchema schema = buildSimpleSchema();
         String ddl = PgVectorSchemaGenerator.generateCreateTableDdl(
-                schema, PG_SCHEMA, PG_TABLE, false, true);
+                schema, PG_SCHEMA, PG_TABLE, false);
 
         assertTrue(ddl.contains("CREATE TABLE IF NOT EXISTS"));
         assertTrue(ddl.contains("\"public\".\"my_collection\""));
@@ -98,7 +98,7 @@ public class PgVectorSchemaGeneratorTest {
     public void testCreateTableDdlWithoutDropExisting() {
         MigrationSchema schema = buildSimpleSchema();
         String ddl = PgVectorSchemaGenerator.generateCreateTableDdl(
-                schema, PG_SCHEMA, PG_TABLE, false, true);
+                schema, PG_SCHEMA, PG_TABLE, false);
 
         assertFalse(ddl.contains("DROP TABLE"));
     }
@@ -117,7 +117,7 @@ public class PgVectorSchemaGeneratorTest {
                 .build();
 
         String ddl = PgVectorSchemaGenerator.generateCreateTableDdl(
-                schema, PG_SCHEMA, PG_TABLE, false, true);
+                schema, PG_SCHEMA, PG_TABLE, false);
 
         assertFalse(ddl.contains("PRIMARY KEY"));
     }
@@ -141,13 +141,13 @@ public class PgVectorSchemaGeneratorTest {
                 .build();
 
         String ddl = PgVectorSchemaGenerator.generateCreateTableDdl(
-                schema, PG_SCHEMA, PG_TABLE, false, true);
+                schema, PG_SCHEMA, PG_TABLE, false);
 
-        assertTrue(ddl.contains("halfvec(64)"));
+        assertTrue(ddl.contains("vector(64)"));
     }
 
     @Test
-    public void testCreateTableDdlWithBfloat16WithoutPrecisionLossThrows() {
+    public void testCreateTableDdlWithBfloat16() {
         MigrationSchema schema = MigrationSchema.builder()
                 .collectionName("bf16_collection")
                 .primaryKeyName("id")
@@ -164,9 +164,10 @@ public class PgVectorSchemaGeneratorTest {
                                 .build()))
                 .build();
 
-        assertThrows(MigrationException.class, () ->
-                PgVectorSchemaGenerator.generateCreateTableDdl(
-                        schema, PG_SCHEMA, PG_TABLE, false, false));
+        String ddl = PgVectorSchemaGenerator.generateCreateTableDdl(
+                schema, PG_SCHEMA, PG_TABLE, false);
+        // BFloat16 → vector(float32) is lossless, should always succeed
+        assertTrue(ddl.contains("vector(64)"));
     }
 
     @Test
@@ -188,7 +189,7 @@ public class PgVectorSchemaGeneratorTest {
                 .build();
 
         String ddl = PgVectorSchemaGenerator.generateCreateTableDdl(
-                schema, PG_SCHEMA, PG_TABLE, false, true);
+                schema, PG_SCHEMA, PG_TABLE, false);
 
         assertTrue(ddl.contains("bit(256)"));
     }
@@ -211,7 +212,7 @@ public class PgVectorSchemaGeneratorTest {
                 .build();
 
         String ddl = PgVectorSchemaGenerator.generateCreateTableDdl(
-                schema, PG_SCHEMA, PG_TABLE, false, true);
+                schema, PG_SCHEMA, PG_TABLE, false);
 
         assertTrue(ddl.contains("sparsevec"));
     }
@@ -235,7 +236,7 @@ public class PgVectorSchemaGeneratorTest {
                 .build();
 
         String ddl = PgVectorSchemaGenerator.generateCreateTableDdl(
-                schema, PG_SCHEMA, PG_TABLE, false, true);
+                schema, PG_SCHEMA, PG_TABLE, false);
 
         assertTrue(ddl.contains("\"tags\" TEXT[]"));
     }
@@ -258,7 +259,7 @@ public class PgVectorSchemaGeneratorTest {
                 .build();
 
         String ddl = PgVectorSchemaGenerator.generateCreateTableDdl(
-                schema, PG_SCHEMA, PG_TABLE, false, true);
+                schema, PG_SCHEMA, PG_TABLE, false);
 
         assertTrue(ddl.contains("\"metadata\" JSONB"));
     }
@@ -399,7 +400,7 @@ public class PgVectorSchemaGeneratorTest {
                 .build();
 
         String ddl = PgVectorSchemaGenerator.generateCreateTableDdl(
-                schema, null, PG_TABLE, false, true);
+                schema, null, PG_TABLE, false);
 
         assertTrue(ddl.contains("\"my_collection\""));
         assertFalse(ddl.contains(".\"my_collection\""));
@@ -419,7 +420,7 @@ public class PgVectorSchemaGeneratorTest {
                 .build();
 
         String ddl = PgVectorSchemaGenerator.generateCreateTableDdl(
-                schema, "", PG_TABLE, false, true);
+                schema, "", PG_TABLE, false);
 
         assertTrue(ddl.contains("\"my_collection\""));
         assertFalse(ddl.contains(".\"my_collection\""));

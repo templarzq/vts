@@ -282,12 +282,11 @@ public class CdcTestReport {
         md.append("- **限制**：无法检测同主键更新（更新不改变主键值，`id > watermark` 无法匹配）\n");
         md.append("- 适用场景：纯插入型数据流，或配合外部全量扫描补偿机制\n\n");
 
-        md.append("### 5.2 GrpcReplicateCdcStrategy\n\n");
-        md.append("基于 Milvus SDK 的策略实现：\n");
-        md.append("- 使用 `getLoadState()` 作为可用性探测\n");
-        md.append("- 数据检索仍采用 PK 轮询（与 PollingIncrementalCdcStrategy 相同）\n");
-        md.append("- **限制**：同样无法检测删除和同主键更新\n");
-        md.append("- 保留为独立实现，以便未来接入 Milvus 公开 CDC订阅 API\n\n");
+        md.append("### 5.2 CdcEventStreamStrategyV2\n\n");
+        md.append("基于 StreamingNode gRPC 的推荐策略实现：\n");
+        md.append("- 通过 Consume RPC 直接访问 Milvus WAL\n");
+        md.append("- **优势**：完整支持 INSERT/DELETE/UPSERT 语义\n");
+        md.append("- 支持 standalone 和 cluster 部署模式\n\n");
 
         md.append("## 6. 结论\n\n");
         int passedCount = 0;

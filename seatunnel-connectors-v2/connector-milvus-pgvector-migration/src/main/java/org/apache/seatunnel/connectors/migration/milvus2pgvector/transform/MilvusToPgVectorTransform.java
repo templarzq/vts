@@ -18,14 +18,9 @@
 package org.apache.seatunnel.connectors.migration.milvus2pgvector.transform;
 
 import org.apache.seatunnel.api.table.catalog.CatalogTable;
-import org.apache.seatunnel.api.table.catalog.Column;
 import org.apache.seatunnel.api.table.catalog.TableIdentifier;
 import org.apache.seatunnel.api.table.catalog.TableSchema;
-import org.apache.seatunnel.api.table.type.SeaTunnelDataType;
 import org.apache.seatunnel.api.table.type.SeaTunnelRow;
-import org.apache.seatunnel.api.table.type.VectorType;
-import org.apache.seatunnel.connectors.migration.milvus2pgvector.exception.MigrationErrorCode;
-import org.apache.seatunnel.connectors.migration.milvus2pgvector.exception.MigrationException;
 import org.apache.seatunnel.transform.common.AbstractCatalogSupportMapTransform;
 
 import lombok.NonNull;
@@ -57,11 +52,7 @@ public class MilvusToPgVectorTransform extends AbstractCatalogSupportMapTransfor
 
     @Override
     protected TableSchema transformTableSchema() {
-        TableSchema original = inputCatalogTable.getTableSchema();
-        if (!config.isAllowPrecisionLoss()) {
-            checkNoBFloat16(original);
-        }
-        return original;
+        return inputCatalogTable.getTableSchema();
     }
 
     @Override
@@ -75,25 +66,5 @@ public class MilvusToPgVectorTransform extends AbstractCatalogSupportMapTransfor
                 inputCatalogTable.getTableId().getDatabaseName(),
                 config.getPgSchema(),
                 tableName);
-    }
-
-    private void checkNoBFloat16(TableSchema schema) {
-        if (schema == null || schema.getColumns() == null) {
-            return;
-        }
-        for (Column col : schema.getColumns()) {
-            SeaTunnelDataType<?> type = col.getDataType();
-            if (type instanceof VectorType) {
-                if (type.getSqlType()
-                        == VectorType.VECTOR_BFLOAT16_TYPE.getSqlType()) {
-                    throw new MigrationException(
-                            MigrationErrorCode.PRECISION_LOSS_NOT_ALLOWED,
-                            "Column "
-                                    + col.getName()
-                                    + " is BFloat16Vector; set allow_precision_loss=true to permit"
-                                    + " halfvec conversion");
-                }
-            }
-        }
     }
 }

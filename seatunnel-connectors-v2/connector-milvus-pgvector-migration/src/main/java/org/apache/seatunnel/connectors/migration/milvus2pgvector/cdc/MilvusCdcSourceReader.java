@@ -27,8 +27,8 @@ import org.apache.seatunnel.api.table.catalog.TableSchema;
 import org.apache.seatunnel.api.table.type.SeaTunnelRow;
 import org.apache.seatunnel.connectors.migration.milvus2pgvector.cdc.streaming.CdcEventStreamStrategyV2;
 import org.apache.seatunnel.connectors.migration.milvus2pgvector.cdc.streaming.CdcEventStreamStrategyV2;
-import org.apache.seatunnel.connectors.migration.milvus2pgvector.schema.AutoCreateTableHelper;
 import org.apache.seatunnel.connectors.seatunnel.milvus.sink.utils.MilvusConnectorUtils;
+import org.apache.seatunnel.connectors.migration.milvus2pgvector.internal.TokenBucketRateLimiter;
 import org.apache.seatunnel.connectors.seatunnel.milvus.source.MilvusBufferReader;
 import org.apache.seatunnel.connectors.seatunnel.milvus.source.MilvusSourceSplit;
 import org.apache.seatunnel.connectors.seatunnel.milvus.source.utils.MilvusSourceConverter;
@@ -42,6 +42,7 @@ import lombok.extern.slf4j.Slf4j;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Deque;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentLinkedDeque;
@@ -75,8 +76,20 @@ public class MilvusCdcSourceReader implements SourceReader<SeaTunnelRow, MilvusC
     private MilvusSourceConverter converter;
     private DescribeCollectionResp collectionDesc;
     private TableSchema tableSchema;
+    private TokenBucketRateLimiter rateLimiter;
     private volatile boolean noMoreSplit;
     private volatile boolean snapshotPhase = true;
+    private volatile boolean snapStartCaptured;
+
+    /** Per-split FAILED_PRECONDITION tracking for exponential backoff. */
+    private final Map<String, FailRecord> failRecords = new HashMap<>();
+    private static final long PRECONDITION_BACKOFF_WINDOW_MS = 30_000;
+
+    private static class FailRecord {
+        long firstFailTime;
+        int failCount;
+        FailRecord(long time) { this.firstFailTime = time; this.failCount = 1; }
+    }
 
     public MilvusCdcSourceReader(
             Context context,
@@ -93,6 +106,14 @@ public class MilvusCdcSourceReader implements SourceReader<SeaTunnelRow, MilvusC
     public void open() throws Exception {
         this.client = new MilvusClientV2(MilvusConnectorUtils.getConnectConfig(config));
 
+        // Initialize rate limiter
+        int rateLimit = cdcConfig.getCdcRateLimitRowsPerSecond() != null
+                ? cdcConfig.getCdcRateLimitRowsPerSecond() : 0;
+        if (rateLimit > 0) {
+            this.rateLimiter = new TokenBucketRateLimiter(rateLimit, 60);
+            log.info("Rate limiter enabled: {} rows/second", rateLimit);
+        }
+
         // Introspect the target collection schema
         CatalogTable catalogTable = sourceTables.values().iterator().next();
         this.tableSchema = catalogTable.getTableSchema();
@@ -104,26 +125,10 @@ public class MilvusCdcSourceReader implements SourceReader<SeaTunnelRow, MilvusC
                         .collectionName(cdcConfig.getCollection())
                         .build());
 
-        // Auto-create target pgvector table from sink config if not exists
-        AutoCreateTableHelper.ensureTable(config, collectionDesc);
-
         // Initialize the CDC strategy
         this.cdcStrategy = createCdcStrategy();
         log.info("MilvusCdcSourceReader opened. Strategy: {}, Collection: {}",
                 cdcStrategy.getClass().getSimpleName(), cdcConfig.getCollection());
-
-        // Capture SnapStartPosition before snapshot begins (ADR-0002).
-        // This avoids full WAL replay via DeliverPolicy.all on fresh runs.
-        if ("INITIAL".equalsIgnoreCase(cdcConfig.getStartupMode())) {
-            String colName = cdcConfig.getEffectiveCollection();
-            if (colName != null) {
-                ReplicatePosition snapPos = cdcStrategy.captureCurrentPosition(colName);
-                if (snapPos != null) {
-                    context.sendSourceEventToEnumerator(
-                            new SnapStartPositionEvent(colName, snapPos));
-                }
-            }
-        }
     }
 
     @Override
@@ -155,9 +160,27 @@ public class MilvusCdcSourceReader implements SourceReader<SeaTunnelRow, MilvusC
 
         // Convert to MilvusSourceSplit so we can reuse MilvusBufferReader
         MilvusSourceSplit sourceSplit = toMilvusSourceSplit(split);
+        java.util.function.IntConsumer limiter = rateLimiter != null
+                ? rateLimiter::acquire : null;
         MilvusBufferReader bufferReader = new MilvusBufferReader(
-                sourceSplit, output, client, tableSchema);
+                sourceSplit, output, client, tableSchema, limiter);
         bufferReader.pollData(cdcConfig.getBatchSize());
+
+        // Capture SnapStartPosition AFTER snapshot completes (at-least-once semantics).
+        // This ensures all snapshot data is written before we record the incremental
+        // start point, avoiding data loss from WAL GC while snapshot was running.
+        // Each reader captures once; the enumerator takes the first position received.
+        if (!snapStartCaptured && "INITIAL".equalsIgnoreCase(cdcConfig.getStartupMode())) {
+            snapStartCaptured = true;
+            String colName = cdcConfig.getEffectiveCollection();
+            if (colName != null) {
+                ReplicatePosition snapPos = cdcStrategy.captureCurrentPosition(colName);
+                if (snapPos != null) {
+                    context.sendSourceEventToEnumerator(
+                            new SnapStartPositionEvent(colName, snapPos));
+                }
+            }
+        }
 
         // Notify enumerator that this snapshot split is complete
         context.sendSourceEventToEnumerator(
@@ -182,6 +205,9 @@ public class MilvusCdcSourceReader implements SourceReader<SeaTunnelRow, MilvusC
             List<SeaTunnelRowWithPosition> events =
                     cdcStrategy.pollChanges(split, startPosition);
 
+            // Successful poll — clear any FAILED_PRECONDITION backoff state
+            failRecords.remove(split.splitId());
+
             for (SeaTunnelRowWithPosition rowPos : events) {
                 output.collect(rowPos.getRow());
             }
@@ -201,16 +227,39 @@ public class MilvusCdcSourceReader implements SourceReader<SeaTunnelRow, MilvusC
 
         } catch (io.grpc.StatusRuntimeException e) {
             io.grpc.Status.Code code = e.getStatus().getCode();
-            // UNMATCHED_CHANNEL_TERM / FAILED_PRECONDITION: stream recovery handled
-            // internally by CdcEventStreamStrategyV2 on the next poll. Re-queue and retry.
             if (code == io.grpc.Status.Code.FAILED_PRECONDITION) {
-                log.warn("Consume stream FAILED_PRECONDITION (may be term change), "
-                        + "re-queuing for automatic recovery");
-                pendingSplits.addFirst(split);
+                // Connection-level error (term change, channel restart).
+                // Use exponential backoff within a 30s window before escalating to INITIAL.
+                long now = System.currentTimeMillis();
+                FailRecord fr = failRecords.computeIfAbsent(split.splitId(),
+                        k -> new FailRecord(now));
+                if (now - fr.firstFailTime < PRECONDITION_BACKOFF_WINDOW_MS) {
+                    long delay = Math.min(1000L << fr.failCount,
+                            PRECONDITION_BACKOFF_WINDOW_MS);
+                    fr.failCount++;
+                    log.warn("Consume stream FAILED_PRECONDITION for split={} (count={}), "
+                            + "re-queuing with {}ms backoff",
+                            split.splitId(), fr.failCount, delay);
+                    Thread.sleep(delay);
+                    pendingSplits.addFirst(split);
+                    return;
+                }
+                // Backoff window exhausted — escalate to INITIAL recovery
+                log.warn("FAILED_PRECONDITION persisted beyond {}ms for split={}, "
+                        + "triggering INITIAL recovery",
+                        PRECONDITION_BACKOFF_WINDOW_MS, split.splitId());
+                failRecords.remove(split.splitId());
+                if (Boolean.TRUE.equals(cdcConfig.getCdcAutoRecoverStalePosition())) {
+                    context.sendSourceEventToEnumerator(
+                            new CheckpointInvalidatedEvent(split.splitId(),
+                                    "FAILED_PRECONDITION persisted: " + e.getMessage()));
+                } else {
+                    throw e;
+                }
                 return;
             }
-            // NOT_FOUND / INVALID_ARGUMENT: WAL position no longer valid (GC'd).
-            // Trigger INITIAL recovery via CheckpointInvalidatedEvent.
+            // NOT_FOUND / INVALID_ARGUMENT: data-level error — WAL position GC'd.
+            // Trigger INITIAL recovery immediately.
             if (code == io.grpc.Status.Code.NOT_FOUND
                     || code == io.grpc.Status.Code.INVALID_ARGUMENT) {
                 if (Boolean.TRUE.equals(cdcConfig.getCdcAutoRecoverStalePosition())) {
@@ -228,9 +277,6 @@ public class MilvusCdcSourceReader implements SourceReader<SeaTunnelRow, MilvusC
                 throw e;
             }
         } catch (RuntimeException e) {
-            // Distinguish transient failures from fatal ones via message inspection.
-            // The strategy's internal recovery for term mismatch will throw
-            // after MAX_RECOVERY_RETRIES — treat that as fatal and trigger INITIAL.
             String msg = e.getMessage();
             if (msg != null && msg.contains("recovery exceeded max retries")) {
                 if (Boolean.TRUE.equals(cdcConfig.getCdcAutoRecoverStalePosition())) {
@@ -349,7 +395,7 @@ public class MilvusCdcSourceReader implements SourceReader<SeaTunnelRow, MilvusC
         // They are no longer instantiated — fall through to polling_incremental.
 
         log.info("Using polling incremental CDC strategy");
-        return new PollingIncrementalCdcStrategy(cdcConfig, converter, tableSchema);
+        return new PollingIncrementalCdcStrategy(cdcConfig, converter, tableSchema, client);
     }
 
 }

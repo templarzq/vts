@@ -31,7 +31,7 @@ import java.sql.Connection;
 import java.sql.DriverManager;
 import java.time.Instant;
 
-/** Orchestrates the three validators: record count, vector similarity, and sampling. */
+/** Orchestrates the validators: record count (fast) and field-level comparison (sampled). */
 @Slf4j
 public class DataValidator implements AutoCloseable {
 
@@ -56,6 +56,7 @@ public class DataValidator implements AutoCloseable {
                 new TokenBucketRateLimiter(
                         config.getRateLimitRowsPerSecond(), config.getRateLimitAcquireTimeoutSeconds());
 
+        // Phase 1: Record count — fast, answers "did we drop rows?"
         log.info("Running record count validation...");
         ValidationResult countResult =
                 new RecordCountValidator(
@@ -67,32 +68,21 @@ public class DataValidator implements AutoCloseable {
                         .validate();
         report.addResult(countResult);
 
-        log.info("Running vector similarity validation (sample={})...", config.getValidationSampleSize());
-        ValidationResult simResult =
-                new VectorSimilarityValidator(
+        // Phase 2: Field-level comparison — sampled, answers "does the data match?"
+        log.info("Running field comparison validation (sample={}, passRateThreshold={})...",
+                config.getValidationSampleSize(), config.getPassRateThreshold());
+        ValidationResult fieldResult =
+                new FieldComparisonValidator(
                                 milvusClient,
                                 pgConnection,
                                 schema,
                                 config.getPgSchema(),
                                 config.getPgTable(),
                                 config.getValidationSampleSize(),
-                                config.getSimilarityThreshold(),
+                                config.getPassRateThreshold(),
                                 rateLimiter)
                         .validate();
-        report.addResult(simResult);
-
-        log.info("Running sampling validation (sample={})...", config.getValidationSampleSize());
-        ValidationResult sampleResult =
-                new SamplingValidator(
-                                milvusClient,
-                                pgConnection,
-                                schema,
-                                config.getPgSchema(),
-                                config.getPgTable(),
-                                config.getValidationSampleSize(),
-                                rateLimiter)
-                        .validate();
-        report.addResult(sampleResult);
+        report.addResult(fieldResult);
 
         log.info("Validation complete: overall={}", report.isOverallPassed() ? "PASSED" : "FAILED");
         return report;

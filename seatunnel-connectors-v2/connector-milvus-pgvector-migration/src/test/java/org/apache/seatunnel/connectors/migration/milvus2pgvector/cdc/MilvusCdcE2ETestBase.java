@@ -518,33 +518,9 @@ public abstract class MilvusCdcE2ETestBase {
                 utils.getTables();
         TableSchema tableSchema = tables.values().iterator().next().getTableSchema();
         MilvusSourceConverter converter = new MilvusSourceConverter(tableSchema);
-        return new PollingIncrementalCdcStrategy(cdcConfig, converter, tableSchema);
+        return new PollingIncrementalCdcStrategy(cdcConfig, converter, tableSchema, milvusClient);
     }
 
-    /**
-     * Build a {@link GrpcReplicateCdcStrategy} for the given collection. The gRPC strategy
-     * creates its own Milvus client and gRPC channel internally; callers must close it after
-     * use (try-with-resources or explicit close).
-     */
-    protected GrpcReplicateCdcStrategy buildGrpcStrategy(
-            String collectionName, int batchSize) {
-        Map<String, Object> configMap = new HashMap<>();
-        configMap.put("url", MILVUS_URL);
-        configMap.put("token", MILVUS_TOKEN);
-        configMap.put("database", MILVUS_DB);
-        configMap.put("collection", collectionName);
-        configMap.put("batch_size", batchSize);
-        configMap.put("incremental_batch_size", 500L);
-        configMap.put("poll_interval_ms", 500L);
-        configMap.put("startup_mode", "INITIAL");
-        configMap.put("cdc_strategy", "grpc_replicate");
-        configMap.put("primary_key_field", "id");
-        configMap.put("channel_timeout_ms", 60000L);  // Increased from 10s to 60s for slower RPC calls
-        configMap.put("parallelism", 1);
-        ReadonlyConfig readonlyConfig = ReadonlyConfig.fromMap(configMap);
-        MilvusCdcSourceConfig cdcConfig = MilvusCdcSourceConfig.of(readonlyConfig);
-        return new GrpcReplicateCdcStrategy(cdcConfig);
-    }
 
     /**
      * Run a snapshot read via any {@link CdcStrategy}: poll all rows with id &gt; -1 until
