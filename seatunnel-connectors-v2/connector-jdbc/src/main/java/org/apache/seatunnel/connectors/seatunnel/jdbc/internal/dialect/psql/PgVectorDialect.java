@@ -18,6 +18,7 @@
 package org.apache.seatunnel.connectors.seatunnel.jdbc.internal.dialect.psql;
 
 import org.apache.seatunnel.connectors.seatunnel.jdbc.internal.converter.JdbcRowConverter;
+import org.apache.seatunnel.connectors.seatunnel.jdbc.internal.dialect.DatabaseIdentifier;
 
 /**
  * PostgreSQL dialect extension for pgvector. Activated via {@code compatible_mode = "pgvector"}.
@@ -30,7 +31,7 @@ public class PgVectorDialect extends PostgresDialect {
 
     private static final long serialVersionUID = 1L;
 
-    public static final String DIALECT_NAME = "pgvector";
+    public static final String DIALECT_NAME = DatabaseIdentifier.POSTGRESQL;
 
     public PgVectorDialect() {}
 
@@ -40,6 +41,8 @@ public class PgVectorDialect extends PostgresDialect {
 
     @Override
     public String dialectName() {
+        // Use POSTGRESQL identifier to match PostgresCatalogFactory for schema
+        // save mode operations. PgVector shares the same PostgreSQL catalog.
         return DIALECT_NAME;
     }
 
