@@ -142,6 +142,7 @@ source {
 
 transform {
   MilvusToPgVector {
+    pg_database = "vectordb"
     pg_schema = "public"
     pg_table = "my_vectors"
     allow_precision_loss = true
@@ -162,6 +163,9 @@ sink {
   }
 }
 ```
+
+> **SSL/TLS 环境**：若 Milvus 已启用 TLS，请将 `url` 改为 `https://` 并添加 `ca_pem_path` 和 `server_name` 参数。详见 [第 17 节](#17-ssltls-连接配置)。
+> **自动建表**：`generate_sink_sql = true` + `savemode.execute.location = "CLIENT"` 可实现自动建表。详见 [第 19 节](#19-自动建表配置指南)。
 
 **启动 CDC 同步任务**：
 
@@ -545,6 +549,7 @@ source {
 
 transform {
   MilvusToPgVector {
+    pg_database = "${pg.database}"
     pg_schema = "${pg.schema}"
     pg_table = "${pg.table}"
     allow_precision_loss = true
@@ -566,6 +571,8 @@ sink {
 ```
 
 变量通过 `seatunnel -i key=value` 注入。
+
+> 如果使用本地模式（`-m local`），建议在 `env` 中添加 `savemode.execute.location = "CLIENT"` 以启用自动建表。
 
 ### 7.3 SeaTunnel 校验任务模板
 
@@ -990,3 +997,256 @@ connector-milvus-pgvector-migration/
     ├── MilvusToPgVectorResumeE2E.java    # 断点续传 E2E（Docker）
     └── MilvusToPgVectorLocalE2E.java     # 本地 E2E（连接已部署服务）
 ```
+
+---
+
+## 17. SSL/TLS 连接配置
+
+Milvus 启用 SSL/TLS 认证后（`tlsMode: 1` 单向认证或 `tlsMode: 2` 双向认证），迁移工具需额外配置证书路径。
+
+### 17.1 Milvus 启用 TLS 步骤
+
+在 `milvus.yaml` 中：
+
+```yaml
+# 外部 TLS（客户端到 Proxy 的通信）
+tls:
+  serverPemPath: /certs/milvus-server.pem
+  serverKeyPath: /certs/milvus-server.key
+  caPemPath: /certs/milvus-ca.pem
+
+# 安全配置
+common:
+  security:
+    tlsMode: 1          # 0=关闭, 1=单向TLS, 2=双向TLS(mTLS)
+    # 若同时启用 HTTP 和 gRPC，须禁用 HTTP（共用端口冲突）
+    # proxy.http.enabled: false
+```
+
+重启 Milvus 生效：
+
+```bash
+docker restart milvus-standalone
+```
+
+### 17.2 配置文件 SSL 参数
+
+所有 Migration Connector 配置（BATCH / STREAMING / CDC）支持以下 SSL 参数：
+
+| 参数 | 说明 | 示例 |
+|------|------|------|
+| `url` | Milvus 地址，**使用 `https://`** | `https://localhost:19530` |
+| `ca_pem_path` | CA 证书路径（用于验证服务端证书） | `/path/to/milvus-ca.pem` |
+| `client_pem_path` | 客户端证书路径（mTLS 时需要） | `/path/to/client.pem` |
+| `client_key_path` | 客户端私钥路径（mTLS 时需要） | `/path/to/client.key` |
+| `server_name` | TLS SNI 服务器名称 | `localhost` |
+
+### 17.3 BATCH 全量迁移 + SSL 配置
+
+```hocon
+source {
+  Milvus {
+    url = "https://localhost:19530"
+    token = ""
+    database = "default"
+    collections = ["my_collection"]
+    batch_size = 100
+    ca_pem_path = "/certs/milvus-ca.pem"
+    server_name = "localhost"
+  }
+}
+```
+
+### 17.4 STREAMING CDC + SSL 配置
+
+```hocon
+source {
+  Milvus-CDC {
+    url = "https://localhost:19530"
+    database = "default"
+    collection = "my_collection"
+    cdc_strategy = "event_stream"
+    startup_mode = "INITIAL"
+    ca_pem_path = "/certs/milvus-ca.pem"
+    server_name = "localhost"
+  }
+}
+```
+
+### 17.5 Python 测试脚本 SSL 配置
+
+```python
+from pymilvus import MilvusClient
+
+client = MilvusClient(
+    uri="https://localhost:19530",
+    server_pem_path="/certs/milvus-ca.pem",
+    server_name="localhost"
+)
+```
+
+---
+
+## 18. Transform 完整参数
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `pg_database` | String | 上游 database 名 | **pgvector 目标数据库名**。必填，用于建表和写入时的数据库识别 |
+| `pg_schema` | String | `public` | pgvector 目标 schema 名 |
+| `pg_table` | String | 上游 table 名 | pgvector 目标表名 |
+| `allow_precision_loss` | boolean | — | 是否允许 BFloat16→halfvec 的精度损失 |
+
+**`pg_database` 的关键作用**：Milvus source 的 `database = "default"` 会被 Transform 默认透传到 sink 端。当 PostgreSQL 数据库名与 "default" 不同（如 `vectordb`）时，必须通过 `pg_database` 显示指定，否则：
+- 建表阶段 `databaseExists("default")` 失败，自动建表不触发
+- CatalogTable 的 databaseName 错误，表路径解析异常
+
+---
+
+## 19. 自动建表配置指南
+
+### 19.1 前提条件
+
+自动建表（`generate_sink_sql = true`）需要满足：
+
+1. **env 配置**：`savemode.execute.location = "CLIENT"`（本地模式必须；集群模式自动生效）
+2. **sink 配置**：`database` = 实际 PG 数据库名；`table = "schema.tablename"`（含 schema 前缀）
+3. **transform 配置**：`pg_database` 与 sink 的 `database` 一致
+4. **pgvector 扩展**：目标库已安装
+
+### 19.2 完整配置模板
+
+```hocon
+env {
+  parallelism = 1
+  job.mode = "BATCH"
+  savemode.execute.location = "CLIENT"
+}
+
+source {
+  Milvus {
+    url = "https://localhost:19530"
+    token = ""
+    database = "default"
+    collections = ["my_collection"]
+    batch_size = 100
+    ca_pem_path = "/certs/milvus-ca.pem"
+    server_name = "localhost"
+  }
+}
+
+transform {
+  MilvusToPgVector {
+    pg_database = "vectordb"
+    pg_schema = "public"
+    pg_table = "my_collection"
+    allow_precision_loss = true
+  }
+}
+
+sink {
+  Jdbc {
+    url = "jdbc:postgresql://localhost:5432/vectordb"
+    driver = "org.postgresql.Driver"
+    user = "postgres"
+    password = "postgres"
+    compatible_mode = "pgvector"
+    generate_sink_sql = true
+    database = "vectordb"
+    table = "public.my_collection"
+  }
+}
+```
+
+---
+
+## 20. SSL 迁移测试流程
+
+端到端的 SSL 环境迁移测试完整步骤。
+
+### 20.1 环境准备
+
+```bash
+# 1. 启动 Milvus
+docker start milvus-etcd milvus-minio milvus-standalone
+
+# 2. 等待健康检查通过
+docker inspect milvus-standalone --format '{{.State.Health.Status}}'
+
+# 3. 验证 TLS 连接
+openssl s_client -connect localhost:19530 </dev/null 2>&1 | grep "CN="
+# 期望: CN = localhost
+
+# 4. Python 验证
+python3 -c "
+from pymilvus import MilvusClient
+c = MilvusClient(
+    uri='https://localhost:19530',
+    server_pem_path='/path/to/milvus-ca.pem',
+    server_name='localhost'
+)
+print(c.list_collections())
+"
+
+# 5. 创建测试数据（1000 行 128 维向量）
+python3 migration-test/scripts/setup_test_data.py
+
+# 6. 准备 pgvector 数据库
+psql -h localhost -U zhangqiang -d postgres <<SQL
+DROP DATABASE IF EXISTS vts_migration_test;
+CREATE DATABASE vts_migration_test;
+\c vts_migration_test
+CREATE EXTENSION vector;
+SQL
+```
+
+### 20.2 构建与部署
+
+```bash
+# 构建
+mvnd clean package -pl seatunnel-dist -am \
+  -Dskip.ui=true -Dmaven.test.skip=true -Prelease -T 8
+
+# 解压
+tar xzf seatunnel-dist/target/apache-seatunnel-2.3.11-SNAPSHOT-bin.tar.gz \
+  -C seatunnel-dist/target/
+```
+
+### 20.3 运行全量迁移
+
+```bash
+SEATUNNEL_HOME=./seatunnel-dist/target/apache-seatunnel-2.3.11-SNAPSHOT
+$SEATUNNEL_HOME/bin/seatunnel.sh \
+  --config migration-test/config/milvus_to_pgvector_local.conf \
+  -m local
+```
+
+期望输出：
+```
+Creating table vts_migration_test.public.vts_test_pgvector with action CREATE TABLE "public"."vts_test_pgvector"
+Job (...) end with state FINISHED
+```
+
+### 20.4 验证结果
+
+```bash
+# 行数一致
+psql -h localhost -U zhangqiang -d vts_migration_test \
+  -c 'SELECT COUNT(*) FROM public.vts_test_pgvector;'
+# 期望: 1000
+
+# 向量精度（Python 脚本）
+python3 migration-test/scripts/verify_migration.py
+# 期望: 1000/1000 行匹配, 相似度 > 0.98
+```
+
+### 20.5 代码变更记录
+
+本次 SSL 测试中修复的关键问题：
+
+| 问题 | 根因 | 修复文件 | 修复内容 |
+|------|------|---------|---------|
+| Java SDK TLS 连接超时 | `caPemPath` 仅用于 mTLS 分支，单向 TLS 需要 `serverPemPath` | `MilvusConnectorUtils.java` | `ca_pem_path` 同时设置 `serverPemPath` |
+| INSERT SQL 含 database 前缀 | `PostgresDialect.tableIdentifier()` 使用 `getFullNameWithQuoted` | `PostgresDialect.java` | 改为 `getSchemaAndTableName` / `quoteIdentifier` |
+| Catalog 找不到 | `PgVectorDialect.dialectName()` 返回 `"pgvector"` 而 `PostgresCatalogFactory` 注册为 `"Postgres"` | `PgVectorDialect.java` | `DIALECT_NAME` 改为 `"Postgres"` |
+| 本地模式不建表 | `savemode.execute.location` 默认 CLUSTER | 配置文件 env | 添加 `savemode.execute.location = "CLIENT"` |
+| 数据库名透传错误 | Transform 透传 source `database="default"` | `MilvusToPgVectorTransform*.java` | 新增 `pg_database` 配置项覆盖 |
