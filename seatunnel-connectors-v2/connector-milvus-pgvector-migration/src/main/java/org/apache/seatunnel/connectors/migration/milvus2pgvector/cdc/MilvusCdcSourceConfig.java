@@ -122,6 +122,17 @@ public class MilvusCdcSourceConfig implements Serializable {
                                     + "If true, uses StreamingNodeHandlerService.Consume; "
                                     + "if false, uses legacy DumpMessages API (requires replication topology).");
 
+    public static final Option<Boolean> STREAMING_NODE_USE_TLS =
+            Options.key("streaming_node_use_tls")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withDescription(
+                            "Enable TLS for StreamingNode gRPC connection (port 22222). "
+                                    + "Default: false. StreamingNode in standalone Milvus does not "
+                                    + "use TLS even when the main Milvus port (19530) has TLS enabled. "
+                                    + "Only set to true if your Milvus deployment explicitly enables "
+                                    + "TLS on the StreamingNode gRPC service.");
+
     public static final Option<String> PRIMARY_KEY_FIELD =
             Options.key("primary_key_field")
                     .stringType()
@@ -303,6 +314,7 @@ public class MilvusCdcSourceConfig implements Serializable {
     private String cdcStartMessageId;
     private String streamingNodeAddress;
     private Boolean cdcUseStreamingNode;
+    private Boolean streamingNodeUseTls;
     private String cdcEtcdCaPath;
     private String cdcEtcdClientCertPath;
     private String cdcEtcdClientKeyPath;
@@ -337,6 +349,7 @@ public class MilvusCdcSourceConfig implements Serializable {
                 .cdcStartMessageId(config.get(CDC_START_MESSAGE_ID))
                 .streamingNodeAddress(config.get(STREAMING_NODE_ADDRESS))
                 .cdcUseStreamingNode(config.get(CDC_USE_STREAMING_NODE))
+                .streamingNodeUseTls(config.get(STREAMING_NODE_USE_TLS))
                 .collections(config.get(COLLECTIONS))
                 .cdcEtcdCaPath(config.get(CDC_ETCD_CA_PATH))
                 .cdcEtcdClientCertPath(config.get(CDC_ETCD_CLIENT_CERT_PATH))

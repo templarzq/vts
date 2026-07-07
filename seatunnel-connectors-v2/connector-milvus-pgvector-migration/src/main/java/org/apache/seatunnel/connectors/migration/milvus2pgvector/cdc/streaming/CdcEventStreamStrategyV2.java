@@ -108,14 +108,23 @@ public class CdcEventStreamStrategyV2 implements CdcStrategy {
                 ? config.getStreamingNodeAddress()
                 : config.getUrl();
 
+        // StreamingNode TLS: only pass cert paths when explicitly enabled.
+        // In standalone Milvus, the StreamingNode gRPC port (22222) is plaintext
+        // even when the main Milvus port (19530) has TLS enabled.
+        final boolean useTls = Boolean.TRUE.equals(config.getStreamingNodeUseTls());
+        final String snCaPath = useTls ? config.getCaPemPath() : null;
+        final String snCertPath = useTls ? config.getClientPemPath() : null;
+        final String snKeyPath = useTls ? config.getClientKeyPath() : null;
+        final String snServerName = useTls ? config.getServerName() : null;
+
         this.streamingNodeClient = new StreamingNodeHandlerClient(
                 streamingNodeAddress,
                 config.getToken(),
                 config.getChannelTimeoutMs(),
-                config.getCaPemPath(),
-                config.getClientPemPath(),
-                config.getClientKeyPath(),
-                config.getServerName());
+                snCaPath,
+                snCertPath,
+                snKeyPath,
+                snServerName);
 
         this.parser = new StreamingMessageParser(collectionDesc, config.getPrimaryKeyField());
         this.parser.setTableId(tableId);

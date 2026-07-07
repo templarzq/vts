@@ -1161,85 +1161,244 @@ sink {
 
 ## 20. SSL 迁移测试流程
 
-端到端的 SSL 环境迁移测试完整步骤。
+端到端的 SSL 环境迁移测试完整步骤，基于实际部署环境验证。
 
-### 20.1 环境准备
+### 20.1 测试环境
 
-```bash
-# 1. 启动 Milvus
-docker start milvus-etcd milvus-minio milvus-standalone
+| 组件 | 配置 |
+|------|------|
+| Milvus | v2.6.9 standalone Docker, `tlsMode: 1` (单向认证), `https://localhost:19530` |
+| etcd | v3.5.5 Docker, mTLS 双向认证, `https://localhost:2379` |
+| PostgreSQL | `localhost:5432`, 用户 `zhangqiang`, pgvector 扩展 |
+| Milvus CA 证书 | `/home/zhangqiang/project/vts/volumes/certs/milvus-ca.pem` |
+| etcd CA/Client 证书 | `/home/zhangqiang/project/vts/certs/etcd-*.pem` |
+| VTS 部署目录 | `/home/zhangqiang/project/vts/seatunnel/` |
+| 测试数据（BATCH） | `vts_test_collection`, 1000 行 128 维向量 |
+| 测试数据（CDC）  | `event_stream_v2_demo`, 505 行 64 维向量 |
 
-# 2. 等待健康检查通过
-docker inspect milvus-standalone --format '{{.State.Health.Status}}'
+### 20.2 Milvus TLS 配置
 
-# 3. 验证 TLS 连接
-openssl s_client -connect localhost:19530 </dev/null 2>&1 | grep "CN="
-# 期望: CN = localhost
+`/home/zhangqiang/project/vts/milvus.yaml` 关键配置：
 
-# 4. Python 验证
-python3 -c "
-from pymilvus import MilvusClient
-c = MilvusClient(
-    uri='https://localhost:19530',
-    server_pem_path='/path/to/milvus-ca.pem',
-    server_name='localhost'
-)
-print(c.list_collections())
-"
+```yaml
+tls:
+  serverPemPath: /certs/milvus-server.pem
+  serverKeyPath: /certs/milvus-server.key
+  caPemPath: /certs/milvus-ca.pem
 
-# 5. 创建测试数据（1000 行 128 维向量）
-python3 migration-test/scripts/setup_test_data.py
+common:
+  security:
+    tlsMode: 1  # 单向 TLS
 
-# 6. 准备 pgvector 数据库
-psql -h localhost -U zhangqiang -d postgres <<SQL
-DROP DATABASE IF EXISTS vts_migration_test;
-CREATE DATABASE vts_migration_test;
-\c vts_migration_test
-CREATE EXTENSION vector;
-SQL
+proxy:
+  http:
+    enabled: false  # 必须禁用，HTTP/gRPC 共用端口冲突
+
+etcd:
+  ssl:
+    enabled: true
+    tlsCert: /certs/etcd-client.pem
+    tlsKey: /certs/etcd-client.key
+    tlsCACert: /certs/etcd-ca.pem
 ```
 
-### 20.2 构建与部署
+### 20.3 构建与部署
 
 ```bash
 # 构建
+cd /home/zhangqiang/download/vector/vts
 mvnd clean package -pl seatunnel-dist -am \
   -Dskip.ui=true -Dmaven.test.skip=true -Prelease -T 8
 
-# 解压
-tar xzf seatunnel-dist/target/apache-seatunnel-2.3.11-SNAPSHOT-bin.tar.gz \
-  -C seatunnel-dist/target/
+# 部署到 /home/zhangqiang/project/vts/
+tar xzf seatunnel-dist/target/apache-seatunnel-2.3.11-SNAPSHOT-bin.tar.gz -C /tmp/
+mv /tmp/apache-seatunnel-2.3.11-SNAPSHOT /home/zhangqiang/project/vts/seatunnel
 ```
 
-### 20.3 运行全量迁移
+### 20.4 BATCH 全量迁移测试
+
+**配置文件**：`/home/zhangqiang/project/vts/milvus_to_pgvector_batch_tls.conf`
+
+```hocon
+env {
+  parallelism = 1
+  job.mode = "BATCH"
+  savemode.execute.location = "CLIENT"
+}
+
+source {
+  Milvus {
+    url = "https://localhost:19530"
+    database = "default"
+    collections = ["vts_test_collection"]
+    batch_size = 100
+    ca_pem_path = "/home/zhangqiang/project/vts/volumes/certs/milvus-ca.pem"
+    server_name = "localhost"
+  }
+}
+
+transform {
+  MilvusToPgVector {
+    pg_database = "vts_migration_test"
+    pg_schema = "public"
+    pg_table = "vts_test_pgvector"
+    allow_precision_loss = true
+  }
+}
+
+sink {
+  Jdbc {
+    url = "jdbc:postgresql://localhost:5432/vts_migration_test"
+    driver = "org.postgresql.Driver"
+    user = "zhangqiang"
+    compatible_mode = "pgvector"
+    generate_sink_sql = true
+    database = "vts_migration_test"
+    table = "public.vts_test_pgvector"
+  }
+}
+```
+
+**运行与验证**：
 
 ```bash
-SEATUNNEL_HOME=./seatunnel-dist/target/apache-seatunnel-2.3.11-SNAPSHOT
-$SEATUNNEL_HOME/bin/seatunnel.sh \
-  --config migration-test/config/milvus_to_pgvector_local.conf \
+# 准备
+psql -h localhost -U zhangqiang -d postgres -c "DROP DATABASE IF EXISTS vts_migration_test;"
+psql -h localhost -U zhangqiang -d postgres -c "CREATE DATABASE vts_migration_test;"
+psql -h localhost -U zhangqiang -d vts_migration_test -c "CREATE EXTENSION vector;"
+
+# 运行
+/home/zhangqiang/project/vts/seatunnel/bin/seatunnel.sh \
+  --config /home/zhangqiang/project/vts/milvus_to_pgvector_batch_tls.conf \
   -m local
-```
 
-期望输出：
-```
-Creating table vts_migration_test.public.vts_test_pgvector with action CREATE TABLE "public"."vts_test_pgvector"
-Job (...) end with state FINISHED
-```
-
-### 20.4 验证结果
-
-```bash
-# 行数一致
+# 验证
 psql -h localhost -U zhangqiang -d vts_migration_test \
   -c 'SELECT COUNT(*) FROM public.vts_test_pgvector;'
 # 期望: 1000
-
-# 向量精度（Python 脚本）
-python3 migration-test/scripts/verify_migration.py
-# 期望: 1000/1000 行匹配, 相似度 > 0.98
 ```
 
-### 20.5 代码变更记录
+**结果**：✅ **1000/1000 行**，自动建表成功，全量迁移通过。
+
+### 20.5 CDC 全量快照 + 增量同步测试
+
+**配置文件**：`/home/zhangqiang/project/vts/milvus_to_pgvector_cdc_tls.conf`
+
+```hocon
+env {
+  parallelism = 1
+  job.mode = "STREAMING"
+  checkpoint.interval = 10000
+}
+
+source {
+  Milvus-CDC {
+    url = "https://localhost:19530"
+    database = "default"
+    collection = "event_stream_v2_demo"
+    collections = ["event_stream_v2_demo"]
+
+    # Milvus TLS（单向）
+    ca_pem_path = "/home/zhangqiang/project/vts/volumes/certs/milvus-ca.pem"
+    server_name = "localhost"
+
+    # etcd TLS（mTLS 双向）
+    cdc_etcd_endpoint = "https://localhost:2379"
+    cdc_etcd_ca_path = "/home/zhangqiang/project/vts/certs/etcd-ca.pem"
+    cdc_etcd_client_cert_path = "/home/zhangqiang/project/vts/certs/etcd-client.pem"
+    cdc_etcd_client_key_path = "/home/zhangqiang/project/vts/certs/etcd-client-pkcs8.key"
+
+    # event_stream V2 策略
+    cdc_strategy = "event_stream"
+    cdc_use_streaming_node = true
+    streaming_node_address = "localhost:22222"
+    startup_mode = "INITIAL"
+    primary_key_field = "id"
+
+    incremental_batch_size = 500
+    poll_interval_ms = 1000
+  }
+}
+
+transform {
+  MilvusToPgVector {
+    pg_database = "vts_cdc_test"
+    pg_schema = "public"
+    pg_table = "event_stream_v2_demo"
+    allow_precision_loss = true
+  }
+}
+
+sink {
+  Jdbc {
+    url = "jdbc:postgresql://localhost:5432/vts_cdc_test"
+    driver = "org.postgresql.Driver"
+    user = "zhangqiang"
+    compatible_mode = "pgvector"
+    generate_sink_sql = true
+    database = "vts_cdc_test"
+    table = "public.event_stream_v2_demo"
+  }
+}
+```
+
+**运行与验证**：
+
+```bash
+# 准备
+psql -h localhost -U zhangqiang -d postgres -c "DROP DATABASE IF EXISTS vts_cdc_test;"
+psql -h localhost -U zhangqiang -d postgres -c "CREATE DATABASE vts_cdc_test;"
+psql -h localhost -U zhangqiang -d vts_cdc_test -c "CREATE EXTENSION vector;"
+
+# 启动 CDC（后台常驻）
+nohup /home/zhangqiang/project/vts/seatunnel/bin/seatunnel.sh \
+  --config /home/zhangqiang/project/vts/milvus_to_pgvector_cdc_tls.conf \
+  -m local > /home/zhangqiang/project/vts/logs/cdc.log 2>&1 &
+
+# 等待全量快照完成
+psql -h localhost -U zhangqiang -d vts_cdc_test \
+  -c 'SELECT COUNT(*) FROM public.event_stream_v2_demo;'
+# 期望: 505
+
+# 增量 INSERT 测试
+python3 -c "
+from pymilvus import MilvusClient
+import time, random
+c = MilvusClient(uri='https://localhost:19530',
+    server_pem_path='/home/zhangqiang/project/vts/volumes/certs/milvus-ca.pem',
+    server_name='localhost')
+DIM = 64
+random.seed(999)
+now = int(time.time())
+data = [{'id': 20000+i, 'vector': [random.random() for _ in range(DIM)],
+         'category': 'incr_test', 'created_at': now+i} for i in range(10)]
+c.insert(collection_name='event_stream_v2_demo', data=data)
+"
+
+# 等待同步后验证
+psql -h localhost -U zhangqiang -d vts_cdc_test \
+  -c "SELECT id, category FROM public.event_stream_v2_demo WHERE category='incr_test';"
+# 期望: 10 行
+
+# 停止 CDC
+pkill -f "seatunnel"
+```
+
+**结果**：
+- ✅ **全量快照 505/505 行**
+- ✅ **增量 INSERT 10/10 行实时同步**
+- etcd TLS mTLS 双向认证通过
+- StreamingNode gRPC pchannel 自动发现通过
+
+### 20.6 全量+增量测试结果汇总
+
+| # | 测试项 | Source 插件 | TLS 范围 | 期望 | 实际 |
+|---|--------|-----------|---------|------|------|
+| 1 | BATCH 全量 | `Milvus` | Milvus 单向 | 1000 | ✅ 1000 |
+| 2 | CDC 全量快照 | `Milvus-CDC` | Milvus + etcd mTLS | 505 | ✅ 505 |
+| 3 | CDC 增量 INSERT | `Milvus-CDC` | Milvus + etcd mTLS | +10 | ✅ +10 |
+
+### 20.7 代码变更记录
 
 本次 SSL 测试中修复的关键问题：
 
@@ -1247,6 +1406,6 @@ python3 migration-test/scripts/verify_migration.py
 |------|------|---------|---------|
 | Java SDK TLS 连接超时 | `caPemPath` 仅用于 mTLS 分支，单向 TLS 需要 `serverPemPath` | `MilvusConnectorUtils.java` | `ca_pem_path` 同时设置 `serverPemPath` |
 | INSERT SQL 含 database 前缀 | `PostgresDialect.tableIdentifier()` 使用 `getFullNameWithQuoted` | `PostgresDialect.java` | 改为 `getSchemaAndTableName` / `quoteIdentifier` |
-| Catalog 找不到 | `PgVectorDialect.dialectName()` 返回 `"pgvector"` 而 `PostgresCatalogFactory` 注册为 `"Postgres"` | `PgVectorDialect.java` | `DIALECT_NAME` 改为 `"Postgres"` |
-| 本地模式不建表 | `savemode.execute.location` 默认 CLUSTER | 配置文件 env | 添加 `savemode.execute.location = "CLIENT"` |
+| pgvector 模式 Catalog 找不到 | `PgVectorDialect.dialectName()` 返回 `"pgvector"` 而 `PostgresCatalogFactory` 注册为 `"Postgres"` | `PgVectorDialect.java` | `DIALECT_NAME` 改为 `"Postgres"` |
+| 本地模式自动建表不触发 | `savemode.execute.location` 默认 CLUSTER | 配置文件 env | 添加 `savemode.execute.location = "CLIENT"` |
 | 数据库名透传错误 | Transform 透传 source `database="default"` | `MilvusToPgVectorTransform*.java` | 新增 `pg_database` 配置项覆盖 |
