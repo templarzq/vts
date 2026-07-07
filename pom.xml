@@ -608,6 +608,7 @@
                         <source>${maven.compiler.source}</source>
                         <target>${maven.compiler.target}</target>
                         <forceJavacCompilerUse>true</forceJavacCompilerUse>
+                        <useIncrementalCompilation>true</useIncrementalCompilation>
                     </configuration>
                 </plugin>
                 <plugin>
