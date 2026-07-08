@@ -37,6 +37,7 @@ import lombok.extern.slf4j.Slf4j;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 /**
@@ -72,6 +73,9 @@ public class CdcEventStreamStrategyV2 implements CdcStrategy {
     private final int shardsNum;
     private final long maxEventsPerPoll;
     private final String sourceClusterId;
+    /** Map of source table paths → catalog tables, used to resolve tableId dynamically. */
+    private final Map<org.apache.seatunnel.api.table.catalog.TablePath,
+            org.apache.seatunnel.api.table.catalog.CatalogTable> sourceTables;
     private final PChannelResolver pchannelResolver;
 
     /** Live Consume stream cursors — one per shard; kept across polls to avoid re-opening. */
@@ -95,9 +99,10 @@ public class CdcEventStreamStrategyV2 implements CdcStrategy {
      */
     public CdcEventStreamStrategyV2(
             MilvusCdcSourceConfig config, DescribeCollectionResp collectionDesc,
-            String tableId) {
+            Map<org.apache.seatunnel.api.table.catalog.TablePath, org.apache.seatunnel.api.table.catalog.CatalogTable> sourceTables) {
         this.pchannelName = config.getCdcPchannel();
         this.collectionId = collectionDesc.getCollectionID();
+        this.sourceTables = sourceTables;
         // Default to 1 shard if not specified (Milvus default)
         this.shardsNum = collectionDesc.getShardsNum() != null
                 ? collectionDesc.getShardsNum() : 1;
@@ -127,7 +132,6 @@ public class CdcEventStreamStrategyV2 implements CdcStrategy {
                 snServerName);
 
         this.parser = new StreamingMessageParser(collectionDesc, config.getPrimaryKeyField());
-        this.parser.setTableId(tableId);
 
         // Initialize pchannel resolver for etcd-based auto-discovery
         this.pchannelResolver = new PChannelResolver(
@@ -139,8 +143,8 @@ public class CdcEventStreamStrategyV2 implements CdcStrategy {
                 config.getCdcEtcdUsername(),
                 config.getCdcEtcdPassword());
 
-        log.info("CdcEventStreamStrategyV2 initialized: pchannel={}, collectionId={}, shardsNum={}, tableId={}, streamingNode={}",
-                pchannelName, collectionId, shardsNum, tableId, streamingNodeAddress);
+        log.info("CdcEventStreamStrategyV2 initialized: pchannel={}, collectionId={}, shardsNum={}, streamingNode={}",
+                pchannelName, collectionId, shardsNum, streamingNodeAddress);
     }
 
     /** Build vchannel names from pchannel + collectionId + shard index. */
@@ -486,6 +490,19 @@ public class CdcEventStreamStrategyV2 implements CdcStrategy {
     @Override
     public List<SeaTunnelRowWithPosition> pollChanges(
             MilvusCdcSourceSplit split, ReplicatePosition startPosition) throws Exception {
+
+        // Resolve the correct tableId for this split's collection.
+        // Multiple collections share one pchannel, so we must dynamically set
+        // the tableId on the parser before parsing messages.
+        String splitCollection = split.getCollectionName();
+        if (splitCollection != null && sourceTables != null) {
+            for (org.apache.seatunnel.api.table.catalog.TablePath tp : sourceTables.keySet()) {
+                if (splitCollection.equals(tp.getTableName())) {
+                    parser.setTableId(tp.toString());
+                    break;
+                }
+            }
+        }
 
         // Open streams if not already open
         if (consumeStreams.isEmpty() || !consumeStreams.get(0).isOpen()) {

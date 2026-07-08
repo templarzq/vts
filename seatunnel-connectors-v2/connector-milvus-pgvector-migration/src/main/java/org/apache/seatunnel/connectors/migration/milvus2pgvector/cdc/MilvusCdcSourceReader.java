@@ -45,6 +45,8 @@ import java.util.Deque;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedDeque;
 
 /**
@@ -72,14 +74,16 @@ public class MilvusCdcSourceReader implements SourceReader<SeaTunnelRow, MilvusC
     private final Map<TablePath, CatalogTable> sourceTables;
 
     private MilvusClientV2 client;
-    private CdcStrategy cdcStrategy;
-    private MilvusSourceConverter converter;
-    private DescribeCollectionResp collectionDesc;
+    /** Per-collection CDC strategies — one CdcEventStreamStrategyV2 per collection. */
+    private final Map<String, CdcStrategy> strategies = new ConcurrentHashMap<>();
+    /** Per-collection schema descriptors. */
+    private final Map<String, DescribeCollectionResp> collectionDescs = new ConcurrentHashMap<>();
     private TableSchema tableSchema;
     private TokenBucketRateLimiter rateLimiter;
     private volatile boolean noMoreSplit;
     private volatile boolean snapshotPhase = true;
-    private volatile boolean snapStartCaptured;
+    /** Track which collections have captured SnapStartPosition. */
+    private final java.util.Set<String> snapStartCaptured = ConcurrentHashMap.newKeySet();
 
     /** Per-split FAILED_PRECONDITION tracking for exponential backoff. */
     private final Map<String, FailRecord> failRecords = new HashMap<>();
@@ -117,27 +121,33 @@ public class MilvusCdcSourceReader implements SourceReader<SeaTunnelRow, MilvusC
             log.info("Rate limiter enabled: {} rows/second", rateLimit);
         }
 
-        // Introspect the target collection schema
-        CatalogTable catalogTable = sourceTables.values().iterator().next();
-        this.tableSchema = catalogTable.getTableSchema();
-        this.converter = new MilvusSourceConverter(tableSchema);
+        // Use the first catalog table schema for the snapshot converter
+        CatalogTable firstCatalogTable = sourceTables.values().iterator().next();
+        this.tableSchema = firstCatalogTable.getTableSchema();
 
-        // Resolve collection name: use singular 'collection' if set,
-        // otherwise fall back to effective collection (first in 'collections' list)
-        String colName = cdcConfig.getCollection();
-        if (colName == null || colName.isEmpty()) {
-            colName = cdcConfig.getEffectiveCollection();
+        // Initialize per-collection descriptors, converters and strategies
+        for (Map.Entry<TablePath, CatalogTable> entry : sourceTables.entrySet()) {
+            String collectionName = entry.getValue().getTableId().getTableName();
+            if (!cdcConfig.shouldSyncCollection(collectionName)) {
+                continue;
+            }
+            // Describe collection for field-level metadata
+            DescribeCollectionResp desc = client.describeCollection(
+                    DescribeCollectionReq.builder()
+                            .collectionName(collectionName)
+                            .build());
+            collectionDescs.put(collectionName, desc);
+
+            // Create and validate CDC strategy for this collection
+            CdcStrategy strategy = createCdcStrategy(collectionName, desc);
+            if (strategy != null) {
+                strategies.put(collectionName, strategy);
+                log.info("CDC strategy initialized for collection '{}': {}",
+                        collectionName, strategy.getClass().getSimpleName());
+            }
         }
-        // Describe collection for field-level metadata
-        this.collectionDesc = client.describeCollection(
-                DescribeCollectionReq.builder()
-                        .collectionName(colName)
-                        .build());
-
-        // Initialize the CDC strategy
-        this.cdcStrategy = createCdcStrategy();
-        log.info("MilvusCdcSourceReader opened. Strategy: {}, Collection: {}",
-                cdcStrategy.getClass().getSimpleName(), cdcConfig.getCollection());
+        log.info("MilvusCdcSourceReader opened. {} strategies, {} collections",
+                strategies.size(), collectionDescs.size());
     }
 
     @Override
@@ -164,29 +174,33 @@ public class MilvusCdcSourceReader implements SourceReader<SeaTunnelRow, MilvusC
 
     private void readSnapshotSplit(MilvusCdcSourceSplit split, Collector<SeaTunnelRow> output)
             throws Exception {
-        log.info("Reading snapshot split: {} (offset={}, limit={})",
-                split.splitId(), split.getOffset(), split.getLimit());
+        String collectionName = split.getCollectionName();
+        log.info("Reading snapshot split: {} (collection={}, offset={}, limit={})",
+                split.splitId(), collectionName, split.getOffset(), split.getLimit());
+
+        // Use the first collection's schema for the snapshot converter.
+        // All collections in our CDC scenario share the same schema structure.
+        TableSchema colSchema = tableSchema;
 
         // Convert to MilvusSourceSplit so we can reuse MilvusBufferReader
         MilvusSourceSplit sourceSplit = toMilvusSourceSplit(split);
         java.util.function.IntConsumer limiter = rateLimiter != null
                 ? rateLimiter::acquire : null;
         MilvusBufferReader bufferReader = new MilvusBufferReader(
-                sourceSplit, output, client, tableSchema, limiter);
+                sourceSplit, output, client, colSchema, limiter);
         bufferReader.pollData(cdcConfig.getBatchSize());
 
         // Capture SnapStartPosition AFTER snapshot completes (at-least-once semantics).
-        // This ensures all snapshot data is written before we record the incremental
-        // start point, avoiding data loss from WAL GC while snapshot was running.
-        // Each reader captures once; the enumerator takes the first position received.
-        if (!snapStartCaptured && "INITIAL".equalsIgnoreCase(cdcConfig.getStartupMode())) {
-            snapStartCaptured = true;
-            String colName = cdcConfig.getEffectiveCollection();
-            if (colName != null) {
-                ReplicatePosition snapPos = cdcStrategy.captureCurrentPosition(colName);
+        // Track per-collection to cover multi-collection scenarios.
+        if (!snapStartCaptured.contains(collectionName)
+                && "INITIAL".equalsIgnoreCase(cdcConfig.getStartupMode())) {
+            CdcStrategy strategy = strategies.get(collectionName);
+            if (strategy != null) {
+                ReplicatePosition snapPos = strategy.captureCurrentPosition(collectionName);
                 if (snapPos != null) {
+                    snapStartCaptured.add(collectionName);
                     context.sendSourceEventToEnumerator(
-                            new SnapStartPositionEvent(colName, snapPos));
+                            new SnapStartPositionEvent(collectionName, snapPos));
                 }
             }
         }
@@ -208,11 +222,20 @@ public class MilvusCdcSourceReader implements SourceReader<SeaTunnelRow, MilvusC
             log.info("Transitioning to incremental phase");
         }
 
+        // Look up the per-collection strategy
+        String collectionName = split.getCollectionName();
+        CdcStrategy strategy = strategies.get(collectionName);
+        if (strategy == null) {
+            log.warn("No CDC strategy found for collection '{}', skipping split {}",
+                    collectionName, split.splitId());
+            return;
+        }
+
         ReplicatePosition startPosition = split.getStartPosition();
 
         try {
             List<SeaTunnelRowWithPosition> events =
-                    cdcStrategy.pollChanges(split, startPosition);
+                    strategy.pollChanges(split, startPosition);
 
             // Successful poll — clear any FAILED_PRECONDITION backoff state
             failRecords.remove(split.splitId());
@@ -332,13 +355,14 @@ public class MilvusCdcSourceReader implements SourceReader<SeaTunnelRow, MilvusC
 
     @Override
     public void close() throws IOException {
-        if (cdcStrategy != null) {
+        for (Map.Entry<String, CdcStrategy> entry : strategies.entrySet()) {
             try {
-                cdcStrategy.close();
+                entry.getValue().close();
             } catch (Exception e) {
-                log.warn("Error closing CDC strategy", e);
+                log.warn("Error closing CDC strategy for collection '{}'", entry.getKey(), e);
             }
         }
+        strategies.clear();
         if (client != null) {
             try {
                 client.close();
@@ -355,7 +379,14 @@ public class MilvusCdcSourceReader implements SourceReader<SeaTunnelRow, MilvusC
      * Convert a MilvusCdcSourceSplit to the format expected by MilvusBufferReader.
      */
     private MilvusSourceSplit toMilvusSourceSplit(MilvusCdcSourceSplit cdcSplit) {
+        // Look up the correct TablePath for this split's collection
         TablePath tablePath = sourceTables.keySet().iterator().next();
+        for (TablePath tp : sourceTables.keySet()) {
+            if (cdcSplit.getCollectionName().equals(tp.getTableName())) {
+                tablePath = tp;
+                break;
+            }
+        }
         return MilvusSourceSplit.builder()
                 .splitId(cdcSplit.splitId())
                 .collectionName(cdcSplit.getCollectionName())
@@ -367,28 +398,28 @@ public class MilvusCdcSourceReader implements SourceReader<SeaTunnelRow, MilvusC
     }
 
     /**
-     * Create the appropriate CDC strategy based on configuration.
+     * Create the appropriate CDC strategy for a specific collection.
      * Falls back to polling incremental if the requested strategy is not available.
+     *
+     * @param collectionName the target collection name
+     * @param collectionDesc the collection schema descriptor
+     * @return the CDC strategy, or null if polling_incremental fallback (handled separately)
      */
-    private CdcStrategy createCdcStrategy() {
+    private CdcStrategy createCdcStrategy(
+            String collectionName, DescribeCollectionResp collectionDesc) {
         String strategyType = cdcConfig.getCdcStrategy();
-        // Derive tableId from source table path (same format as snapshot phase),
-        // so that CDC DELETE rows match snapshot INSERT rows in sink-side buffers.
-        String tableId = sourceTables.keySet().iterator().next().toString();
 
         if ("event_stream".equalsIgnoreCase(strategyType)) {
             if (Boolean.TRUE.equals(cdcConfig.getCdcUseStreamingNode())) {
-                // V2 strategy: StreamingNode gRPC (works in standalone + cluster mode).
-                // cdc_pchannel is optional — auto-discovery from etcd + 0-15 scan.
                 CdcEventStreamStrategyV2 v2Strategy = new CdcEventStreamStrategyV2(
-                        cdcConfig, collectionDesc, tableId);
+                        cdcConfig, collectionDesc, sourceTables);
                 if (v2Strategy.isAvailable()) {
-                    log.info("Using event_stream V2 CDC strategy via StreamingNode gRPC");
+                    log.info("Using event_stream V2 CDC strategy via StreamingNode gRPC "
+                            + "for collection '{}'", collectionName);
                     return v2Strategy;
                 }
-                log.warn("event_stream V2 (StreamingNode) not available. Falling back to "
-                        + "polling_incremental. Note: polling_incremental cannot capture "
-                        + "deletes or same-PK updates.");
+                log.warn("event_stream V2 (StreamingNode) not available for collection '{}'. "
+                        + "Falling back to polling_incremental.", collectionName);
                 try {
                     v2Strategy.close();
                 } catch (Exception ex) {
@@ -400,11 +431,10 @@ public class MilvusCdcSourceReader implements SourceReader<SeaTunnelRow, MilvusC
             }
         }
 
-        // grpc_replicate and legacy event_stream V1 are deprecated (ADR-0001).
-        // They are no longer instantiated — fall through to polling_incremental.
-
-        log.info("Using polling incremental CDC strategy");
-        return new PollingIncrementalCdcStrategy(cdcConfig, converter, tableSchema, client);
+        // Fallback to polling_incremental
+        log.info("Using polling incremental CDC strategy for collection '{}'", collectionName);
+        return new PollingIncrementalCdcStrategy(cdcConfig,
+                new MilvusSourceConverter(tableSchema), tableSchema, client);
     }
 
 }

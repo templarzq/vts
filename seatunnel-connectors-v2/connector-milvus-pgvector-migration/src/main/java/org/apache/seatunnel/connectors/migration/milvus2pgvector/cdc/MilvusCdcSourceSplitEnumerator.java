@@ -73,7 +73,8 @@ public class MilvusCdcSourceSplitEnumerator
     private Map<String, ReplicatePosition> splitPositions;
     private long globalTimeTick;
     private Map<String, ReplicatePosition> snapStartPositions;
-    private Set<Integer> readersWithCompletedSnapshot;
+    /** Track completed snapshot SPLIT IDs (not reader IDs) for multi-split transition. */
+    private final Set<String> completedSnapshotSplitIds = ConcurrentHashMap.newKeySet();
     /** Number of snapshot splits created — used to signal transition when all are done. */
     private int totalSnapshotSplits = 0;
 
@@ -88,7 +89,6 @@ public class MilvusCdcSourceSplitEnumerator
         this.cdcConfig = cdcConfig;
         this.tables = tables;
         this.pendingSplits = new ConcurrentHashMap<>();
-        this.readersWithCompletedSnapshot = ConcurrentHashMap.newKeySet();
 
         if (sourceState != null) {
             this.snapshotCompleted = sourceState.isSnapshotCompleted();
@@ -156,25 +156,26 @@ public class MilvusCdcSourceSplitEnumerator
     public void handleSourceEvent(int subtaskId, SourceEvent event) {
         if (event instanceof SnapshotCompletedEvent) {
             SnapshotCompletedEvent sce = (SnapshotCompletedEvent) event;
-            log.info("Reader {} completed snapshot for split {}", subtaskId, sce.getSplitId());
-            readersWithCompletedSnapshot.add(subtaskId);
+            completedSnapshotSplitIds.add(sce.getSplitId());
+            log.info("Reader {} completed snapshot for split {} (total completed: {}/{})",
+                    subtaskId, sce.getSplitId(),
+                    completedSnapshotSplitIds.size(), totalSnapshotSplits);
 
-            // Transition to incremental when ALL snapshot splits (not all readers)
-            // have been completed. With parallelism > snapshot splits, some readers
-            // never receive a split and would otherwise block the transition forever.
-            int completed = readersWithCompletedSnapshot.size();
+            // Transition to incremental when ALL snapshot splits have been completed.
+            // Tracked by split IDs (not reader IDs) because a single reader may process
+            // many splits sequentially.
+            int completed = completedSnapshotSplitIds.size();
             if (completed >= totalSnapshotSplits) {
                 snapshotCompleted = true;
-                log.info("All {} snapshot splits completed ({} reader(s) participated). "
-                        + "Transitioning to incremental phase.",
-                        totalSnapshotSplits, completed);
+                log.info("All {} snapshot splits completed. Transitioning to incremental phase.",
+                        totalSnapshotSplits);
                 try {
                     run();
                 } catch (Exception e) {
                     log.error("Error transitioning to incremental phase", e);
                 }
             } else {
-                log.debug("Snapshot progress: {}/{} splits completed",
+                log.info("Snapshot progress: {}/{} splits completed",
                         completed, totalSnapshotSplits);
             }
         } else if (event instanceof IncrementalPositionEvent) {
