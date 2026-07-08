@@ -74,6 +74,8 @@ public class MilvusCdcSourceSplitEnumerator
     private long globalTimeTick;
     private Map<String, ReplicatePosition> snapStartPositions;
     private Set<Integer> readersWithCompletedSnapshot;
+    /** Number of snapshot splits created — used to signal transition when all are done. */
+    private int totalSnapshotSplits = 0;
 
     public MilvusCdcSourceSplitEnumerator(
             Context<MilvusCdcSourceSplit> context,
@@ -157,15 +159,23 @@ public class MilvusCdcSourceSplitEnumerator
             log.info("Reader {} completed snapshot for split {}", subtaskId, sce.getSplitId());
             readersWithCompletedSnapshot.add(subtaskId);
 
-            // Check if all registered readers have completed their snapshots
-            if (readersWithCompletedSnapshot.containsAll(context.registeredReaders())) {
+            // Transition to incremental when ALL snapshot splits (not all readers)
+            // have been completed. With parallelism > snapshot splits, some readers
+            // never receive a split and would otherwise block the transition forever.
+            int completed = readersWithCompletedSnapshot.size();
+            if (completed >= totalSnapshotSplits) {
                 snapshotCompleted = true;
-                log.info("All readers completed snapshot. Transitioning to incremental phase.");
+                log.info("All {} snapshot splits completed ({} reader(s) participated). "
+                        + "Transitioning to incremental phase.",
+                        totalSnapshotSplits, completed);
                 try {
                     run();
                 } catch (Exception e) {
                     log.error("Error transitioning to incremental phase", e);
                 }
+            } else {
+                log.debug("Snapshot progress: {}/{} splits completed",
+                        completed, totalSnapshotSplits);
             }
         } else if (event instanceof IncrementalPositionEvent) {
             IncrementalPositionEvent ipe = (IncrementalPositionEvent) event;
@@ -325,7 +335,7 @@ public class MilvusCdcSourceSplitEnumerator
     private void splitByOffset(MilvusCdcSourceSplit baseSplit, int parallelism) throws Exception {
         if (parallelism <= 1) {
             baseSplit.setSplitId("snapshot-" + baseSplit.getCollectionName() + "-0");
-            addPendingSplit(Collections.singletonList(baseSplit));
+            addSnapshotSplit(Collections.singletonList(baseSplit));
             return;
         }
 
@@ -346,7 +356,7 @@ public class MilvusCdcSourceSplitEnumerator
                     .offset(offset)
                     .limit(limit)
                     .build();
-            addPendingSplit(Collections.singletonList(split));
+            addSnapshotSplit(Collections.singletonList(split));
         }
     }
 
@@ -374,9 +384,6 @@ public class MilvusCdcSourceSplitEnumerator
     }
 
     private void generateIncrementalSplits() {
-        int readerCount = context.registeredReaders().size();
-        if (readerCount == 0) readerCount = 1;
-
         long startId = getMaxSeenId();
 
         // Get all collections that should be synced
@@ -396,31 +403,32 @@ public class MilvusCdcSourceSplitEnumerator
             }
         }
 
-        // Generate one incremental split per reader per collection
+        // Generate ONE incremental split per collection (not per reader).
+        // The WAL is a single logical stream — multiple readers would
+        // duplicate the same messages. A single reader opens ConsumeStreams
+        // for all vchannels (shards) in round-robin, achieving full coverage.
         int idx = 0;
         for (String collectionName : syncedCollections) {
-            for (int readerId : context.registeredReaders()) {
-                String splitId = "cdc-inc-" + collectionName + "-" + idx++;
-                ReplicatePosition startPos = splitPositions.get(splitId);
-                // Fall back to SnapStartPosition for fresh runs (avoids DeliverPolicy.all)
-                if (startPos == null) {
-                    startPos = snapStartPositions.get(collectionName);
-                    if (startPos != null) {
-                        log.info("Using SnapStartPosition for collection '{}': messageId={}",
-                                collectionName, startPos.getMessageId());
-                    }
+            String splitId = "cdc-inc-" + collectionName + "-" + idx++;
+            ReplicatePosition startPos = splitPositions.get(splitId);
+            // Fall back to SnapStartPosition for fresh runs (avoids DeliverPolicy.all)
+            if (startPos == null) {
+                startPos = snapStartPositions.get(collectionName);
+                if (startPos != null) {
+                    log.info("Using SnapStartPosition for collection '{}': messageId={}",
+                            collectionName, startPos.getMessageId());
                 }
-
-                MilvusCdcSourceSplit incSplit = MilvusCdcSourceSplit.builder()
-                        .splitId(splitId)
-                        .collectionName(collectionName)
-                        .snapshot(false)
-                        .startId(startId)
-                        .endId(Long.MAX_VALUE)
-                        .startPosition(startPos)
-                        .build();
-                addPendingSplit(Collections.singletonList(incSplit));
             }
+
+            MilvusCdcSourceSplit incSplit = MilvusCdcSourceSplit.builder()
+                    .splitId(splitId)
+                    .collectionName(collectionName)
+                    .snapshot(false)
+                    .startId(startId)
+                    .endId(Long.MAX_VALUE)
+                    .startPosition(startPos)
+                    .build();
+            addPendingSplit(Collections.singletonList(incSplit));
         }
     }
 
@@ -439,6 +447,12 @@ public class MilvusCdcSourceSplitEnumerator
             int owner = getSplitOwner(split.splitId(), context.registeredReaders().size());
             pendingSplits.computeIfAbsent(owner, k -> new ArrayList<>()).add(split);
         }
+    }
+
+    /** Add a snapshot split and track it for completion counting. */
+    private void addSnapshotSplit(Collection<MilvusCdcSourceSplit> splits) {
+        totalSnapshotSplits += splits.size();
+        addPendingSplit(splits);
     }
 
     private int getSplitOwner(String splitId, int numReaders) {
