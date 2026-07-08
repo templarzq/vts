@@ -62,6 +62,9 @@ public class ConsumeStream implements Iterator<ImmutableMessage>, AutoCloseable 
     // Flag indicating if stream is still open
     private volatile boolean isOpen = true;
 
+    // Counter of messages dropped due to queue overflow (for monitoring)
+    private volatile long droppedMessages = 0;
+
     // Error from server (if any)
     private volatile Throwable streamError = null;
 
@@ -101,7 +104,16 @@ public class ConsumeStream implements Iterator<ImmutableMessage>, AutoCloseable 
             String pchannelName) {
         this.asyncStub = asyncStub;
         this.pchannelName = pchannelName;
-        this.messageQueue = new LinkedBlockingQueue<>(1000);  // Buffer size
+        // Bounded queue with put()-based backpressure.
+        // The gRPC server pushes WAL messages continuously via streaming —
+        // it does NOT wait for pollChanges() to consume. When the consumer
+        // (pollChanges → parse → JDBC sink) is slower than the producer
+        // (gRPC WAL stream), the queue fills up. put() blocks the gRPC
+        // callback thread, which triggers gRPC flow control to signal the
+        // Milvus server to pause — the correct end-to-end backpressure chain.
+        // Capacity must be large enough to absorb bursts between polls
+        // but small enough to keep memory bounded.
+        this.messageQueue = new LinkedBlockingQueue<>(2000);
 
         // Create response observer for handling server responses
         StreamObserver<ConsumeResponse> responseObserver = new StreamObserver<ConsumeResponse>() {
@@ -110,8 +122,33 @@ public class ConsumeStream implements Iterator<ImmutableMessage>, AutoCloseable 
                 if (response.hasConsume()) {
                     // Received a WAL message via ConsumeMessageReponse
                     ImmutableMessage message = response.getConsume().getMessage();
-                    if (!messageQueue.offer(message)) {
-                        log.warn("Message queue full for pchannel={}, dropping message", pchannelName);
+                    // Backpressure via put(): when the consumer (JDBC sink) is slower
+                    // than the producer (gRPC WAL stream), the bounded queue fills up
+                    // and put() blocks this gRPC callback thread. This triggers gRPC
+                    // flow control, which signals the Milvus server to slow down —
+                    // the correct end-to-end backpressure chain. No messages are dropped.
+                    try {
+                        int queueSize = messageQueue.size();
+                        // Early warning at 60% — consumer is falling behind
+                        if (queueSize >= 1200 && queueSize < 1800) {
+                            log.warn("Message queue filling up for pchannel={}: "
+                                    + "size={}/2000 (60%) — consumer may be lagging",
+                                    pchannelName, queueSize);
+                        }
+                        // Critical at 90% — backpressure about to engage
+                        if (queueSize >= 1800) {
+                            log.warn("Message queue nearly full for pchannel={}: "
+                                    + "size={}/2000 (90%) — backpressure engaging, "
+                                    + "gRPC stream will slow down",
+                                    pchannelName, queueSize);
+                        }
+                        messageQueue.put(message);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        droppedMessages++;
+                        log.warn("Interrupted while enqueuing message for pchannel={}, "
+                                + "dropping message (total dropped: {})",
+                                pchannelName, droppedMessages);
                     }
                 } else if (response.hasCreate()) {
                     // Consumer created successfully
@@ -439,6 +476,22 @@ public class ConsumeStream implements Iterator<ImmutableMessage>, AutoCloseable 
      */
     public String getCreateVchannelErrorCause() {
         return createVchannelErrorCause;
+    }
+
+    /**
+     * Get the count of messages dropped due to queue overflow or interruption.
+     * Non-zero values indicate backpressure was insufficient or the consumer
+     * thread was interrupted during enqueue.
+     */
+    public long getDroppedMessages() {
+        return droppedMessages;
+    }
+
+    /**
+     * Get the current queue size (for monitoring/backpressure visibility).
+     */
+    public int getQueueSize() {
+        return messageQueue.size();
     }
 
     /**

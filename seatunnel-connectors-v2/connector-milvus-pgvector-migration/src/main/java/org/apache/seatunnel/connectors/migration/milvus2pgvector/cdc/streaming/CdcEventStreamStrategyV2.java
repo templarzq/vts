@@ -520,8 +520,13 @@ public class CdcEventStreamStrategyV2 implements CdcStrategy {
             if (!stream.isOpen()) continue;
             long streamEvents = 0;
             try {
+                // NOTE: eventCount tracks the GLOBAL total across all streams.
+                // We check streamEvents < eventsPerStream (per-stream cap) AND
+                // eventCount < maxEventsPerPoll (global cap). eventCount already
+                // includes the current stream's events, so we do NOT add
+                // streamEvents — that would double-count the current stream.
                 while (stream.hasNext() && streamEvents < eventsPerStream
-                        && (eventCount + streamEvents) < maxEventsPerPoll) {
+                        && eventCount < maxEventsPerPoll) {
                     ImmutableMessage message = stream.next();
                     eventCount++;
                     streamEvents++;
@@ -568,8 +573,19 @@ public class CdcEventStreamStrategyV2 implements CdcStrategy {
             }
         } else {
             emptyPollCount = 0;
-            log.info("Poll completed: {} events, {} rows ({} streams, {} shards)",
-                    eventCount, results.size(), consumeStreams.size(), shardsNum);
+            // Collect dropped message counts from all streams for visibility
+            long totalDropped = 0;
+            for (ConsumeStream stream : consumeStreams) {
+                totalDropped += stream.getDroppedMessages();
+            }
+            if (totalDropped > 0) {
+                log.warn("Poll completed: {} events, {} rows ({} streams, {} shards) "
+                        + "— {} MESSAGES DROPPED due to queue overflow!",
+                        eventCount, results.size(), consumeStreams.size(), shardsNum, totalDropped);
+            } else {
+                log.info("Poll completed: {} events, {} rows ({} streams, {} shards)",
+                        eventCount, results.size(), consumeStreams.size(), shardsNum);
+            }
         }
         return results;
     }

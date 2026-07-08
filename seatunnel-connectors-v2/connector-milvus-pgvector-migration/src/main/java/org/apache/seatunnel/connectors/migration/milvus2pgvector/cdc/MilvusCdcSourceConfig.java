@@ -122,6 +122,12 @@ public class MilvusCdcSourceConfig implements Serializable {
                                     + "If true, uses StreamingNodeHandlerService.Consume; "
                                     + "if false, uses legacy DumpMessages API (requires replication topology).");
 
+    /**
+     * Whether StreamingNode gRPC port uses TLS. Independent from Milvus Proxy TLS
+     * (tlsMode=1 only enables TLS on the Proxy port 19530; the StreamingNode port
+     * 22222 is plaintext by default in standalone mode). Set to true only when the
+     * StreamingNode port is explicitly configured with TLS.
+     */
     public static final Option<Boolean> STREAMING_NODE_USE_TLS =
             Options.key("streaming_node_use_tls")
                     .booleanType()
