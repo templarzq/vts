@@ -102,16 +102,12 @@ public class MilvusCdcSourceReader implements SourceReader<SeaTunnelRow, MilvusC
         this.sourceTables = sourceTables;
     }
 
-    /** Static lock for thread-safe MilvusClientV2 initialization across parallel readers. */
-    private static final Object CLIENT_CREATE_LOCK = new Object();
-
     @Override
     public void open() throws Exception {
-        // MilvusClientV2 initialization includes JVM SSL context setup which is not
-        // thread-safe. Synchronize to prevent NPE when parallelism > 1.
-        synchronized (CLIENT_CREATE_LOCK) {
-            this.client = new MilvusClientV2(MilvusConnectorUtils.getConnectConfig(config));
-        }
+        // SSLContext initialization in MilvusConnectorUtils is guarded to run
+        // only once (sslContextInitialized flag). Each reader can safely create
+        // its own MilvusClientV2 in parallel.
+        this.client = new MilvusClientV2(MilvusConnectorUtils.getConnectConfig(config));
 
         // Initialize rate limiter
         int rateLimit = cdcConfig.getCdcRateLimitRowsPerSecond() != null
@@ -126,10 +122,16 @@ public class MilvusCdcSourceReader implements SourceReader<SeaTunnelRow, MilvusC
         this.tableSchema = catalogTable.getTableSchema();
         this.converter = new MilvusSourceConverter(tableSchema);
 
+        // Resolve collection name: use singular 'collection' if set,
+        // otherwise fall back to effective collection (first in 'collections' list)
+        String colName = cdcConfig.getCollection();
+        if (colName == null || colName.isEmpty()) {
+            colName = cdcConfig.getEffectiveCollection();
+        }
         // Describe collection for field-level metadata
         this.collectionDesc = client.describeCollection(
                 DescribeCollectionReq.builder()
-                        .collectionName(cdcConfig.getCollection())
+                        .collectionName(colName)
                         .build());
 
         // Initialize the CDC strategy

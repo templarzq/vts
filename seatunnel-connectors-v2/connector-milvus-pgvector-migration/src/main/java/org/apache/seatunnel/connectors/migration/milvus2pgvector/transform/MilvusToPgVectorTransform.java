@@ -47,6 +47,9 @@ public class MilvusToPgVectorTransform extends AbstractCatalogSupportMapTransfor
 
     @Override
     protected SeaTunnelRow transformRow(SeaTunnelRow inputRow) {
+        // Map the row's tableId to match the sink's expected format
+        // (TablePath.toString: database.schema.table)
+        inputRow.setTableId(getProducedCatalogTable().getTableId().toTablePath().toString());
         return inputRow;
     }
 

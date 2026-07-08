@@ -136,7 +136,16 @@ public class MilvusConnectorUtils {
      * does not correctly override the JDK trust manager, causing PKIX path
      * building failures for self-signed or private CA certificates.
      */
+    /** Guard to ensure JVM global SSLContext is initialized exactly once. */
+    private static volatile boolean sslContextInitialized = false;
+
     private static synchronized void registerCaCert(String caPemPath) {
+        // JVM SSLContext.setDefault() is process-global — modifying it while
+        // other threads are mid-RPC causes NullPointerException in gRPC.
+        // Execute only once; subsequent calls are no-ops.
+        if (sslContextInitialized) {
+            return;
+        }
         try {
             // Load the CA certificate from PEM
             CertificateFactory cf = CertificateFactory.getInstance("X.509");
@@ -182,6 +191,7 @@ public class MilvusConnectorUtils {
             SSLContext.setDefault(sslContext);
 
             log.info("Registered CA cert into JVM default SSLContext: {}", caPemPath);
+            sslContextInitialized = true;
         } catch (Exception e) {
             log.warn("Failed to register CA cert (TLS may fail): {}", e.getMessage());
         }
