@@ -254,8 +254,10 @@ public class MilvusCdcSourceReader implements SourceReader<SeaTunnelRow, MilvusC
                         new IncrementalPositionEvent(split.splitId(), lastEvent.getPosition()));
             }
 
-            // Re-queue the incremental split to keep the stream alive
-            pendingSplits.addFirst(split);
+            // Re-queue the incremental split at the TAIL (not head) to ensure
+            // fair round-robin across all collections. addFirst would starve
+            // other splits because the same split is always re-polled first.
+            pendingSplits.addLast(split);
 
         } catch (io.grpc.StatusRuntimeException e) {
             io.grpc.Status.Code code = e.getStatus().getCode();
@@ -273,7 +275,7 @@ public class MilvusCdcSourceReader implements SourceReader<SeaTunnelRow, MilvusC
                             + "re-queuing with {}ms backoff",
                             split.splitId(), fr.failCount, delay);
                     Thread.sleep(delay);
-                    pendingSplits.addFirst(split);
+                    pendingSplits.addLast(split);
                     return;
                 }
                 // Backoff window exhausted — escalate to INITIAL recovery
