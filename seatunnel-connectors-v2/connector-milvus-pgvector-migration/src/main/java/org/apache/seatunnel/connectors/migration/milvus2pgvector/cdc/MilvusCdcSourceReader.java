@@ -28,6 +28,7 @@ import org.apache.seatunnel.api.table.type.SeaTunnelRow;
 import org.apache.seatunnel.connectors.migration.milvus2pgvector.cdc.streaming.CdcEventStreamStrategyV2;
 import org.apache.seatunnel.connectors.migration.milvus2pgvector.cdc.streaming.CdcEventStreamStrategyV2;
 import org.apache.seatunnel.connectors.seatunnel.milvus.sink.utils.MilvusConnectorUtils;
+import org.apache.seatunnel.connectors.migration.milvus2pgvector.schema.AutoCreateTableHelper;
 import org.apache.seatunnel.connectors.migration.milvus2pgvector.internal.TokenBucketRateLimiter;
 import org.apache.seatunnel.connectors.seatunnel.milvus.source.MilvusBufferReader;
 import org.apache.seatunnel.connectors.seatunnel.milvus.source.MilvusSourceSplit;
@@ -131,11 +132,27 @@ public class MilvusCdcSourceReader implements SourceReader<SeaTunnelRow, MilvusC
             if (!cdcConfig.shouldSyncCollection(collectionName)) {
                 continue;
             }
-            // Describe collection for field-level metadata
-            DescribeCollectionResp desc = client.describeCollection(
-                    DescribeCollectionReq.builder()
-                            .collectionName(collectionName)
-                            .build());
+            // Describe collection for field-level metadata.
+            // If the collection has been dropped (e.g. during CDC runtime),
+            // skip it gracefully instead of crashing the job. Data already
+            // synced to the sink remains intact.
+            DescribeCollectionResp desc;
+            try {
+                desc = client.describeCollection(
+                        DescribeCollectionReq.builder()
+                                .collectionName(collectionName)
+                                .build());
+            } catch (Exception e) {
+                String msg = e.getMessage() == null ? "" : e.getMessage().toLowerCase();
+                if (msg.contains("can't find collection") || msg.contains("not found")
+                        || msg.contains("doesn't exist") || msg.contains("not exist")) {
+                    log.warn("Collection '{}' not found (possibly dropped), "
+                            + "skipping CDC for this collection. "
+                            + "Data already synced to sink remains intact.", collectionName);
+                    continue;
+                }
+                throw e;
+            }
             collectionDescs.put(collectionName, desc);
 
             // Create and validate CDC strategy for this collection
@@ -178,6 +195,18 @@ public class MilvusCdcSourceReader implements SourceReader<SeaTunnelRow, MilvusC
         log.info("Reading snapshot split: {} (collection={}, offset={}, limit={})",
                 split.splitId(), collectionName, split.getOffset(), split.getLimit());
 
+        // Auto-create target table from Milvus collection schema if it doesn't exist
+        DescribeCollectionResp collectionDesc = collectionDescs.get(collectionName);
+        if (collectionDesc != null) {
+            try {
+                AutoCreateTableHelper.ensureTable(config, collectionDesc,
+                        cdcConfig.getSinkJdbcUrl());
+            } catch (Exception e) {
+                log.warn("Auto-create table failed for collection '{}': {}",
+                        collectionName, e.getMessage());
+            }
+        }
+
         // Use the first collection's schema for the snapshot converter.
         // All collections in our CDC scenario share the same schema structure.
         TableSchema colSchema = tableSchema;
@@ -188,6 +217,13 @@ public class MilvusCdcSourceReader implements SourceReader<SeaTunnelRow, MilvusC
                 ? rateLimiter::acquire : null;
         MilvusBufferReader bufferReader = new MilvusBufferReader(
                 sourceSplit, output, client, colSchema, limiter);
+        // Configure collection load retry from CDC config
+        if (cdcConfig.getCdcCollectionLoadMaxRetries() != null) {
+            bufferReader.setLoadRetryConfig(
+                    cdcConfig.getCdcCollectionLoadMaxRetries(),
+                    cdcConfig.getCdcCollectionLoadRetryDelayMs() != null
+                            ? cdcConfig.getCdcCollectionLoadRetryDelayMs() : 5000L);
+        }
         bufferReader.pollData(cdcConfig.getBatchSize());
 
         // Capture SnapStartPosition AFTER snapshot completes (at-least-once semantics).
@@ -436,7 +472,7 @@ public class MilvusCdcSourceReader implements SourceReader<SeaTunnelRow, MilvusC
         // Fallback to polling_incremental
         log.info("Using polling incremental CDC strategy for collection '{}'", collectionName);
         return new PollingIncrementalCdcStrategy(cdcConfig,
-                new MilvusSourceConverter(tableSchema), tableSchema, client);
+                new MilvusSourceConverter(tableSchema), tableSchema, client, collectionName);
     }
 
 }

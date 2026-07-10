@@ -65,6 +65,7 @@ import java.util.Optional;
 @Slf4j
 public class CdcEventStreamStrategyV2 implements CdcStrategy {
 
+    private final MilvusCdcSourceConfig config;
     private final StreamingNodeHandlerClient streamingNodeClient;
     private final StreamingMessageParser parser;
     /** Configured pchannel — may be updated by auto-discovery in {@link #isAvailable()}. */
@@ -100,6 +101,7 @@ public class CdcEventStreamStrategyV2 implements CdcStrategy {
     public CdcEventStreamStrategyV2(
             MilvusCdcSourceConfig config, DescribeCollectionResp collectionDesc,
             Map<org.apache.seatunnel.api.table.catalog.TablePath, org.apache.seatunnel.api.table.catalog.CatalogTable> sourceTables) {
+        this.config = config;
         this.pchannelName = config.getCdcPchannel();
         this.collectionId = collectionDesc.getCollectionID();
         this.sourceTables = sourceTables;
@@ -686,16 +688,49 @@ public class CdcEventStreamStrategyV2 implements CdcStrategy {
         log.info("Opening {} Consume streams for {} vchannels on pchannel={}",
                 vchannels.size(), vchannels, resolvedPchannel);
 
-        closeStreams();
-        for (String vchannel : vchannels) {
-            ConsumeStream stream = tryCreateStreamForChannel(resolvedPchannel, vchannel, policy);
-            if (stream != null) {
-                consumeStreams.add(stream);
-            } else {
-                log.error("Failed to open stream for vchannel={}", vchannel);
-                throw new RuntimeException("Failed to open CDC stream for vchannel=" + vchannel);
+        final int maxOpenRetries = config.getCdcStreamOpenMaxRetries() != null
+                ? config.getCdcStreamOpenMaxRetries() : 5;
+        final long retryDelayMs = config.getCdcStreamOpenRetryDelayMs() != null
+                ? config.getCdcStreamOpenRetryDelayMs() : 5000L;
+        for (int retry = 0; retry < maxOpenRetries; retry++) {
+            closeStreams();
+            boolean allOpened = true;
+            for (String vchannel : vchannels) {
+                ConsumeStream stream = tryCreateStreamForChannel(resolvedPchannel, vchannel, policy);
+                if (stream != null) {
+                    consumeStreams.add(stream);
+                } else {
+                    log.error("Failed to open stream for vchannel={} (attempt {}/{})",
+                            vchannel, retry + 1, maxOpenRetries);
+                    allOpened = false;
+                    break;
+                }
+            }
+
+            if (allOpened && !consumeStreams.isEmpty()) {
+                log.info("All {} Consume streams opened successfully for pchannel={}",
+                        consumeStreams.size(), resolvedPchannel);
+                return;
+            }
+
+            // Reset term cache and retry — the server may have changed term
+            if (retry < maxOpenRetries - 1) {
+                log.warn("Retrying stream open after {}ms (clear term cache, retry {}/{})",
+                        retryDelayMs, retry + 2, maxOpenRetries);
+                cachedTerm = -1;
+                lastStreamCurrentTerm = -1;
+                try {
+                    Thread.sleep(retryDelayMs);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new RuntimeException("Interrupted while retrying stream open", e);
+                }
             }
         }
+
+        log.error("Failed to open Consume streams for pchannel={} after {} retries",
+                resolvedPchannel, maxOpenRetries);
+        throw new RuntimeException("Failed to open CDC stream for pchannel=" + resolvedPchannel);
     }
 
     /** Try open a single stream using term probing. */

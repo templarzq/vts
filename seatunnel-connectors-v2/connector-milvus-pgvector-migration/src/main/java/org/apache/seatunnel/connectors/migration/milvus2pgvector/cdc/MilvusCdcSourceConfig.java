@@ -295,6 +295,34 @@ public class MilvusCdcSourceConfig implements Serializable {
                                     + "Overrides the GetReplicateInfo bootstrap checkpoint. "
                                     + "Use only when you know the exact WAL position to resume from.");
 
+    /** Max retries for opening CDC Consume streams (event_stream strategy). */
+    public static final Option<Integer> CDC_STREAM_OPEN_MAX_RETRIES =
+            Options.key("cdc_stream_open_max_retries")
+                    .intType()
+                    .defaultValue(5)
+                    .withDescription("Max retries when opening Consume streams fails. Default: 5");
+
+    /** Delay in milliseconds between retries for opening Consume streams. */
+    public static final Option<Long> CDC_STREAM_OPEN_RETRY_DELAY_MS =
+            Options.key("cdc_stream_open_retry_delay_ms")
+                    .longType()
+                    .defaultValue(5000L)
+                    .withDescription("Delay in ms between Consume stream open retries. Default: 5000");
+
+    /** Max retries for reloading a collection that was released during migration. */
+    public static final Option<Integer> CDC_COLLECTION_LOAD_MAX_RETRIES =
+            Options.key("cdc_collection_load_max_retries")
+                    .intType()
+                    .defaultValue(60)
+                    .withDescription("Max retries when waiting for collection to load. Default: 60");
+
+    /** Delay in milliseconds between collection load state checks. */
+    public static final Option<Long> CDC_COLLECTION_LOAD_RETRY_DELAY_MS =
+            Options.key("cdc_collection_load_retry_delay_ms")
+                    .longType()
+                    .defaultValue(5000L)
+                    .withDescription("Delay in ms between collection load state checks. Default: 5000");
+
     private String url;
     private String token;
     private String database;
@@ -329,6 +357,14 @@ public class MilvusCdcSourceConfig implements Serializable {
     private Boolean cdcAutoRecoverStalePosition;
     private Integer cdcRateLimitRowsPerSecond;
     private String sinkJdbcUrl;
+    @Builder.Default
+    private Integer cdcStreamOpenMaxRetries = 5;
+    @Builder.Default
+    private Long cdcStreamOpenRetryDelayMs = 5000L;
+    @Builder.Default
+    private Integer cdcCollectionLoadMaxRetries = 60;
+    @Builder.Default
+    private Long cdcCollectionLoadRetryDelayMs = 5000L;
 
     public static MilvusCdcSourceConfig of(ReadonlyConfig config) {
         return MilvusCdcSourceConfig.builder()
@@ -365,6 +401,10 @@ public class MilvusCdcSourceConfig implements Serializable {
                 .cdcAutoRecoverStalePosition(config.get(CDC_AUTO_RECOVER_STALE_POSITION))
                 .cdcRateLimitRowsPerSecond(config.get(CDC_RATE_LIMIT_ROWS_PER_SECOND))
                 .sinkJdbcUrl(config.get(SINK_JDBC_URL))
+                .cdcStreamOpenMaxRetries(config.get(CDC_STREAM_OPEN_MAX_RETRIES))
+                .cdcStreamOpenRetryDelayMs(config.get(CDC_STREAM_OPEN_RETRY_DELAY_MS))
+                .cdcCollectionLoadMaxRetries(config.get(CDC_COLLECTION_LOAD_MAX_RETRIES))
+                .cdcCollectionLoadRetryDelayMs(config.get(CDC_COLLECTION_LOAD_RETRY_DELAY_MS))
                 .build();
     }
 
@@ -382,6 +422,12 @@ public class MilvusCdcSourceConfig implements Serializable {
      * @param collectionName the collection to check
      * @return true if this collection should be included in sync
      */
+    // Explicit getters for fields added after initial Lombok generation
+    public Integer getCdcStreamOpenMaxRetries() { return cdcStreamOpenMaxRetries; }
+    public Long getCdcStreamOpenRetryDelayMs() { return cdcStreamOpenRetryDelayMs; }
+    public Integer getCdcCollectionLoadMaxRetries() { return cdcCollectionLoadMaxRetries; }
+    public Long getCdcCollectionLoadRetryDelayMs() { return cdcCollectionLoadRetryDelayMs; }
+
     public boolean shouldSyncCollection(String collectionName) {
         if (collection != null && !collection.isEmpty()) {
             return collection.equals(collectionName);

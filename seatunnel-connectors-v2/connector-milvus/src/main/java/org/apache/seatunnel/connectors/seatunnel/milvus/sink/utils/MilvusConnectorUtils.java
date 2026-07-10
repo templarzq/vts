@@ -87,6 +87,8 @@ public class MilvusConnectorUtils {
         ConnectConfig connectConfig = ConnectConfig.builder()
                 .uri(config.get(MilvusSourceConfig.URL))
                 .token(config.get(MilvusSourceConfig.TOKEN))
+                .username(config.get(MilvusCommonConfig.USERNAME))
+                .password(config.get(MilvusCommonConfig.PASSWORD))
                 .dbName(config.get(MilvusSourceConfig.DATABASE))
                 .connectTimeoutMs(30000)
                 .build();

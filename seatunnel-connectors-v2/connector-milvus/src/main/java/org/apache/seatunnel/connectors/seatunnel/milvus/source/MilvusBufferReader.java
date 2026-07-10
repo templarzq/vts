@@ -4,6 +4,7 @@ import io.milvus.orm.iterator.QueryIterator;
 import io.milvus.response.QueryResultsWrapper;
 import io.milvus.v2.client.MilvusClientV2;
 import io.milvus.v2.service.collection.request.GetLoadStateReq;
+import io.milvus.v2.service.collection.request.LoadCollectionReq;
 import io.milvus.v2.service.vector.request.QueryIteratorReq;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.StringUtils;
@@ -34,6 +35,9 @@ public class MilvusBufferReader {
     private final MilvusSourceSplit split;
     private final CountDownLatch completionSignal = new CountDownLatch(1);
     private long rateLimitRetryIntervalMs = 30000;
+    /** Configurable collection load retry params — settable before {@link #pollData}. */
+    private int loadMaxRetries = 60;
+    private long loadRetryDelayMs = 5000;
     /** Optional rate limiter callback — called with batch size before reading each batch. */
     private final java.util.function.IntConsumer rateLimiter;
 
@@ -57,16 +61,67 @@ public class MilvusBufferReader {
         this.limit = split.getLimit();
     }
 
+    /** Configure collection load retry behavior. Call before {@link #pollData}. */
+    public void setLoadRetryConfig(int maxRetries, long delayMs) {
+        this.loadMaxRetries = maxRetries;
+        this.loadRetryDelayMs = delayMs;
+    }
+
+    /**
+     * Ensure the collection is loaded. If not, try to load it and wait for it
+     * to become ready (with retries). Throws if loading fails after max retries.
+     */
+    private void ensureCollectionLoaded(String collectionName) {
+        final int maxRetries = loadMaxRetries;
+        final long waitMs = loadRetryDelayMs;
+
+        for (int attempt = 1; attempt <= maxRetries; attempt++) {
+            boolean loaded;
+            try {
+                loaded = milvusClient.getLoadState(
+                        GetLoadStateReq.builder().collectionName(collectionName).build());
+            } catch (Exception e) {
+                log.warn("Failed to check load state for collection '{}' (attempt {}/{}): {}",
+                        collectionName, attempt, maxRetries, e.getMessage());
+                loaded = false;
+            }
+
+            if (loaded) {
+                return;
+            }
+
+            if (attempt == 1) {
+                log.warn("Collection '{}' is not loaded, attempting to load...", collectionName);
+                try {
+                    milvusClient.loadCollection(
+                            LoadCollectionReq.builder().collectionName(collectionName).build());
+                    log.info("Load request sent for collection '{}'", collectionName);
+                } catch (Exception e) {
+                    log.warn("Load collection request failed for '{}': {}. Will retry...",
+                            collectionName, e.getMessage());
+                }
+            }
+
+            if (attempt < maxRetries) {
+                try {
+                    Thread.sleep(waitMs);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new MilvusConnectorException(
+                            MilvusConnectionErrorCode.COLLECTION_NOT_LOADED,
+                            "Interrupted while waiting for collection '" + collectionName + "' to load");
+                }
+            }
+        }
+
+        throw new MilvusConnectorException(
+                MilvusConnectionErrorCode.COLLECTION_NOT_LOADED,
+                "Collection '" + collectionName + "' failed to load after " + maxRetries + " retries");
+    }
+
     public void pollData(Integer batchSize) {
         log.info("Starting to read data from Milvus, table schema: {}", tableSchema.toString());
-
-        Boolean loadState = milvusClient.getLoadState(
-                GetLoadStateReq.builder()
-                        .collectionName(collectionName)
-                        .build());
-        if (!loadState) {
-            throw new MilvusConnectorException(MilvusConnectionErrorCode.COLLECTION_NOT_LOADED);
-        }
+        ensureCollectionLoaded(collectionName);
 
         log.info("Collection '{}' is loaded. Starting query execution...", collectionName);
         // query iterate data in background

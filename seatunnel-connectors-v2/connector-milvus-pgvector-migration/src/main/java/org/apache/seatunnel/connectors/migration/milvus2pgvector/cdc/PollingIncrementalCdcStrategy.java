@@ -26,6 +26,7 @@ import io.milvus.orm.iterator.QueryIterator;
 import io.milvus.response.QueryResultsWrapper;
 import io.milvus.v2.client.MilvusClientV2;
 import io.milvus.v2.service.collection.request.GetLoadStateReq;
+import io.milvus.v2.service.collection.request.LoadCollectionReq;
 import io.milvus.v2.service.vector.request.QueryIteratorReq;
 
 import lombok.extern.slf4j.Slf4j;
@@ -52,25 +53,76 @@ public class PollingIncrementalCdcStrategy implements CdcStrategy {
             MilvusCdcSourceConfig config,
             MilvusSourceConverter converter,
             TableSchema tableSchema,
-            MilvusClientV2 client) {
+            MilvusClientV2 client,
+            String collectionName) {
         this.config = config;
         this.converter = converter;
         this.tableSchema = tableSchema;
-        this.collectionName = config.getCollection();
+        this.collectionName = collectionName;
         this.primaryKeyField = config.getPrimaryKeyField();
         this.client = client;
+    }
+
+    /**
+     * Ensure the collection is loaded. If not, try to load it and wait for it
+     * to become ready (with retries). Retry params from {@link MilvusCdcSourceConfig}.
+     */
+    private void ensureCollectionLoaded() {
+        final int maxRetries = config.getCdcCollectionLoadMaxRetries() != null
+                ? config.getCdcCollectionLoadMaxRetries() : 60;
+        final long waitMs = config.getCdcCollectionLoadRetryDelayMs() != null
+                ? config.getCdcCollectionLoadRetryDelayMs() : 5000L;
+
+        for (int attempt = 1; attempt <= maxRetries; attempt++) {
+            boolean loaded;
+            try {
+                loaded = client.getLoadState(
+                        GetLoadStateReq.builder().collectionName(collectionName).build());
+            } catch (Exception e) {
+                log.warn("Failed to check load state for collection '{}' (attempt {}/{}): {}",
+                        collectionName, attempt, maxRetries, e.getMessage());
+                loaded = false;
+            }
+
+            if (loaded) {
+                return;
+            }
+
+            if (attempt == 1) {
+                log.warn("Collection '{}' is not loaded, attempting to load...", collectionName);
+                try {
+                    client.loadCollection(
+                            LoadCollectionReq.builder().collectionName(collectionName).build());
+                    log.info("Load request sent for collection '{}'", collectionName);
+                } catch (Exception e) {
+                    log.warn("Load collection request failed for '{}': {}. Will retry...",
+                            collectionName, e.getMessage());
+                }
+            }
+
+            if (attempt >= maxRetries) {
+                break;
+            }
+
+            try {
+                Thread.sleep(waitMs);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                log.warn("Interrupted while waiting for collection '{}' to load, giving up",
+                        collectionName);
+                return;
+            }
+        }
+
+        log.warn("Collection '{}' still not loaded after {} retries, polling will retry on next cycle",
+                collectionName, maxRetries);
     }
 
     @Override
     public List<SeaTunnelRowWithPosition> pollChanges(
             MilvusCdcSourceSplit split, ReplicatePosition startPosition) throws Exception {
-        GetLoadStateReq loadStateReq = GetLoadStateReq.builder()
-                .collectionName(collectionName)
-                .build();
-        if (!client.getLoadState(loadStateReq)) {
-            log.warn("Collection {} is not loaded, cannot poll for changes", collectionName);
-            return Collections.emptyList();
-        }
+        // Auto-reload collection if it was released during migration
+        ensureCollectionLoaded();
 
         // Determine the watermark — support both numeric and string PKs.
         // Numeric PK: watermark stored in startPosition.timeTick and split.startId.

@@ -44,6 +44,8 @@ import lombok.extern.slf4j.Slf4j;
 import java.io.File;
 import java.net.URI;
 import java.net.URISyntaxException;
+import java.nio.charset.StandardCharsets;
+import java.util.Base64;
 import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 
@@ -60,7 +62,6 @@ import java.util.concurrent.TimeUnit;
 public class StreamingNodeHandlerClient implements AutoCloseable {
 
     private static final String AUTHORIZATION_HEADER = "authorization";
-    private static final String BEARER_PREFIX = "Bearer ";
     private static final String CREATE_CONSUMER_HEADER = "create-consumer";
 
     private final ManagedChannel channel;
@@ -162,7 +163,11 @@ public class StreamingNodeHandlerClient implements AutoCloseable {
             Metadata metadata = new Metadata();
             Metadata.Key<String> key =
                     Metadata.Key.of(AUTHORIZATION_HEADER, Metadata.ASCII_STRING_MARSHALLER);
-            metadata.put(key, BEARER_PREFIX + token);
+            // Token format per Milvus auth interceptor: base64(username:password)
+            // No "Bearer " prefix — the interceptor does not strip it.
+            String encodedToken = Base64.getEncoder()
+                    .encodeToString(token.getBytes(StandardCharsets.UTF_8));
+            metadata.put(key, encodedToken);
             builder.intercept(MetadataUtils.newAttachHeadersInterceptor(metadata));
         }
 

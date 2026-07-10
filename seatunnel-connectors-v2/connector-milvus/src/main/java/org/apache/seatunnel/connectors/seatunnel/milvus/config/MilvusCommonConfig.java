@@ -35,6 +35,19 @@ public abstract class MilvusCommonConfig {
                     .stringType()
                     .noDefaultValue()
                     .withDescription("Milvus token for authentication");
+
+    public static final Option<String> USERNAME =
+            Options.key("username")
+                    .stringType()
+                    .noDefaultValue()
+                    .withDescription("Milvus username for authentication");
+
+    public static final Option<String> PASSWORD =
+            Options.key("password")
+                    .stringType()
+                    .noDefaultValue()
+                    .withDescription("Milvus password for authentication");
+
     public static final Option<String> CLIENT_PEM_PATH =
             Options.key("client_pem_path")
                     .stringType()

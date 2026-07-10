@@ -43,19 +43,22 @@ public final class AutoCreateTableHelper {
 
     /**
      * Ensure the target table exists, creating it from the Milvus collection
-     * schema if it does not. Reads {@code url}, {@code user}, {@code password},
-     * and {@code table} (format: "schema.table") from the sink section of the
-     * full job config.
+     * schema if it does not. Reads {@code url}, {@code user}, {@code password}
+     * from the sink section keys of the full job config.
      *
      * @param config         full job ReadonlyConfig (not just the source subtree)
      * @param collectionDesc Milvus collection description
+     * @param sinkJdbcUrl    explicit JDBC URL from source cdc config (sink_jdbc_url),
+     *                       avoids source/sink key conflict in nested config
      * @return true if the table existed or was created successfully
      */
     public static boolean ensureTable(ReadonlyConfig config,
-                                       DescribeCollectionResp collectionDesc) {
-        // Read explicit sink_jdbc_url from source config (avoids source/sink key conflict).
+                                       DescribeCollectionResp collectionDesc,
+                                       String sinkJdbcUrl) {
+        // Use the explicit sink_jdbc_url from CDC source config (avoids nested-key issue).
         // schema_save_mode only works in cluster mode, so we need this for local mode.
-        String url = config.toMap().get("sink_jdbc_url");
+        String url = (sinkJdbcUrl != null && !sinkJdbcUrl.isEmpty())
+                ? sinkJdbcUrl : config.toMap().get("sink_jdbc_url");
         if (url == null || url.isEmpty()) {
             log.info("No sink_jdbc_url configured, skipping auto-create-table");
             return false;
@@ -78,6 +81,27 @@ public final class AutoCreateTableHelper {
         try (Connection conn = DriverManager.getConnection(url, user, password)) {
             if (tableExists(conn, schema, table)) {
                 log.info("Target table \"{}\".\"{}\" already exists", schema, table);
+                // Ensure primary key constraint exists — table may have been created
+                // by an older version without PK or manually without a unique constraint.
+                // ON CONFLICT clause requires a unique/exclusion constraint on the target column.
+                String pkName = collectionDesc.getCollectionSchema() != null
+                        && collectionDesc.getCollectionSchema().getFieldSchemaList() != null
+                        ? collectionDesc.getCollectionSchema()
+                                .getFieldSchemaList().stream()
+                                .filter(f -> Boolean.TRUE.equals(f.getIsPrimaryKey()))
+                                .map(f -> f.getName())
+                                .findFirst().orElse(null)
+                        : null;
+                if (pkName != null && !hasPrimaryKey(conn, schema, table, pkName)) {
+                    String alterSql = "ALTER TABLE " + quoteQualified(schema, table)
+                            + " ADD PRIMARY KEY (" + quoteIdent(pkName) + ")";
+                    log.info("Adding missing primary key:\n{}", alterSql);
+                    try (Statement stmt = conn.createStatement()) {
+                        stmt.execute(alterSql);
+                    }
+                    log.info("Primary key added on \"{}\" for \"{}\".\"{}\"",
+                            pkName, schema, table);
+                }
                 return true;
             }
 
@@ -105,6 +129,35 @@ public final class AutoCreateTableHelper {
             ResultSet rs = stmt.executeQuery(sql);
             return rs.next() && rs.getBoolean(1);
         }
+    }
+
+    /** Check whether a primary key constraint exists on the given column. */
+    private static boolean hasPrimaryKey(Connection conn, String schema, String table,
+                                          String columnName) throws Exception {
+        try (Statement stmt = conn.createStatement()) {
+            String sql = "SELECT EXISTS ("
+                    + "SELECT 1 FROM information_schema.table_constraints tc "
+                    + "JOIN information_schema.key_column_usage kcu "
+                    + "  ON tc.constraint_name = kcu.constraint_name "
+                    + " AND tc.table_schema = kcu.table_schema "
+                    + "WHERE tc.constraint_type IN ('PRIMARY KEY', 'UNIQUE') "
+                    + "AND tc.table_schema = '" + schema.replace("'", "''") + "' "
+                    + "AND tc.table_name = '" + table.replace("'", "''") + "' "
+                    + "AND kcu.column_name = '" + columnName.replace("'", "''") + "')";
+            ResultSet rs = stmt.executeQuery(sql);
+            return rs.next() && rs.getBoolean(1);
+        }
+    }
+
+    private static String quoteIdent(String ident) {
+        return "\"" + ident.replace("\"", "\"\"") + "\"";
+    }
+
+    private static String quoteQualified(String schema, String table) {
+        if (schema == null || schema.isEmpty()) {
+            return quoteIdent(table);
+        }
+        return quoteIdent(schema) + "." + quoteIdent(table);
     }
 
     private static MigrationSchema buildSchema(DescribeCollectionResp resp) {

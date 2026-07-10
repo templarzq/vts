@@ -518,7 +518,7 @@ public abstract class MilvusCdcE2ETestBase {
                 utils.getTables();
         TableSchema tableSchema = tables.values().iterator().next().getTableSchema();
         MilvusSourceConverter converter = new MilvusSourceConverter(tableSchema);
-        return new PollingIncrementalCdcStrategy(cdcConfig, converter, tableSchema, milvusClient);
+        return new PollingIncrementalCdcStrategy(cdcConfig, converter, tableSchema, milvusClient, cdcConfig.getCollection());
     }
 
 
