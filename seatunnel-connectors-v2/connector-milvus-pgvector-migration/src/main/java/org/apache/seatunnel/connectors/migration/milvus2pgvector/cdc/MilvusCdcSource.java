@@ -71,12 +71,35 @@ public class MilvusCdcSource
         // Build sourceTables. When collections=["*"], list all collections
         // from Milvus and pass those names to the utility, because the utility
         // treats "*" as a literal collection name.
-        if (cdcConfig.isSyncAllCollections()) {
-            this.sourceTables = discoverAllCollections();
-        } else {
-            MilvusSourceConnectorUtils utils = new MilvusSourceConnectorUtils(config);
-            this.sourceTables = utils.getTables();
+        // If the collection has been dropped (e.g. during CDC runtime), the
+        // describeCollection call will fail. We throw a clear exception so
+        // the user understands the situation instead of seeing a raw stack
+        // trace. Data already synced to the sink remains intact.
+        Map<TablePath, CatalogTable> tables;
+        try {
+            if (cdcConfig.isSyncAllCollections()) {
+                tables = discoverAllCollections();
+            } else {
+                MilvusSourceConnectorUtils utils = new MilvusSourceConnectorUtils(config);
+                tables = utils.getTables();
+            }
+        } catch (Exception e) {
+            String msg = e.getMessage() == null ? "" : e.getMessage().toLowerCase();
+            if (msg.contains("can't find collection") || msg.contains("not found")
+                    || msg.contains("doesn't exist") || msg.contains("not exist")) {
+                log.warn("Collection not found (possibly dropped). "
+                        + "Data already synced to sink remains intact. {}", e.getMessage());
+                throw new RuntimeException(
+                        "CDC source cannot start: collection '"
+                                + cdcConfig.getCollection()
+                                + "' not found in Milvus (possibly dropped). "
+                                + "Data already synced to the sink remains intact. "
+                                + "If the collection was dropped intentionally, "
+                                + "no further action is needed.", e);
+            }
+            throw e;
         }
+        this.sourceTables = tables;
     }
 
     private Map<TablePath, CatalogTable> discoverAllCollections() {
