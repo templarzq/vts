@@ -31,6 +31,7 @@ import org.apache.seatunnel.api.sink.SaveModeHandler;
 import org.apache.seatunnel.api.sink.SeaTunnelSink;
 import org.apache.seatunnel.api.sink.SupportMultiTableSink;
 import org.apache.seatunnel.api.sink.SupportSaveMode;
+import org.apache.seatunnel.api.sink.multitablesink.MultiTableSink;
 import org.apache.seatunnel.api.source.SeaTunnelSource;
 import org.apache.seatunnel.api.source.SourceSplit;
 import org.apache.seatunnel.api.table.catalog.CatalogTable;
@@ -696,7 +697,17 @@ public class MultipleTableJobConfigParser {
     }
 
     public void handleSaveMode(SeaTunnelSink<?, ?, ?, ?> sink) {
-        if (SupportSaveMode.class.isAssignableFrom(sink.getClass())) {
+        if (sink instanceof MultiTableSink) {
+            // MultiTableSink does not implement SupportSaveMode directly, but
+            // wraps the underlying sinks. Iterate and dispatch each one.
+            Map<TablePath, SeaTunnelSink> innerSinks = ((MultiTableSink) sink).getSinks();
+            log.info(
+                    "Detected MultiTableSink, dispatching save mode handling to {} inner sink(s)",
+                    innerSinks.size());
+            for (SeaTunnelSink<?, ?, ?, ?> inner : innerSinks.values()) {
+                handleSaveMode(inner);
+            }
+        } else if (SupportSaveMode.class.isAssignableFrom(sink.getClass())) {
             SupportSaveMode saveModeSink = (SupportSaveMode) sink;
             if (envOptions
                     .get(EnvCommonOptions.SAVEMODE_EXECUTE_LOCATION)
@@ -711,6 +722,11 @@ public class MultipleTableJobConfigParser {
                     } catch (Exception e) {
                         throw new SeaTunnelRuntimeException(HANDLE_SAVE_MODE_FAILED, e);
                     }
+                } else {
+                    log.warn(
+                            "Sink {} implements SupportSaveMode but getSaveModeHandler() returned empty; "
+                                    + "skipping save mode (table will not be auto-created).",
+                            sink.getClass().getName());
                 }
             }
         }

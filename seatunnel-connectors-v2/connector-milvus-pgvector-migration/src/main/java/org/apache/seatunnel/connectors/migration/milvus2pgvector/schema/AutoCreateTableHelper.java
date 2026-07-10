@@ -55,6 +55,25 @@ public final class AutoCreateTableHelper {
     public static boolean ensureTable(ReadonlyConfig config,
                                        DescribeCollectionResp collectionDesc,
                                        String sinkJdbcUrl) {
+        return ensureTable(config, collectionDesc, sinkJdbcUrl, false);
+    }
+
+    /**
+     * Ensure the target table exists, optionally dropping it first if {@code dropExisting}
+     * is true. When {@code dropExisting} is true, the table will be dropped and recreated
+     * from the current collection schema — this handles the scenario where the Milvus
+     * collection was dropped and recreated with a potentially different schema during CDC.
+     *
+     * @param config         full job ReadonlyConfig (not just the source subtree)
+     * @param collectionDesc Milvus collection description
+     * @param sinkJdbcUrl    explicit JDBC URL from source cdc config (sink_jdbc_url)
+     * @param dropExisting   if true, drop the target table first if it exists, then recreate
+     * @return true if the table was created/verified successfully
+     */
+    public static boolean ensureTable(ReadonlyConfig config,
+                                       DescribeCollectionResp collectionDesc,
+                                       String sinkJdbcUrl,
+                                       boolean dropExisting) {
         // Use the explicit sink_jdbc_url from CDC source config (avoids nested-key issue).
         // schema_save_mode only works in cluster mode, so we need this for local mode.
         String url = (sinkJdbcUrl != null && !sinkJdbcUrl.isEmpty())
@@ -79,6 +98,17 @@ public final class AutoCreateTableHelper {
         }
 
         try (Connection conn = DriverManager.getConnection(url, user, password)) {
+            MigrationSchema migrationSchema = buildSchema(collectionDesc);
+
+            if (dropExisting && tableExists(conn, schema, table)) {
+                String dropSql = "DROP TABLE IF EXISTS " + quoteQualified(schema, table) + " CASCADE";
+                log.info("Dropping existing target table:\n{}", dropSql);
+                try (Statement stmt = conn.createStatement()) {
+                    stmt.execute(dropSql);
+                }
+                log.info("Target table \"{}\".\"{}\" dropped successfully", schema, table);
+            }
+
             if (tableExists(conn, schema, table)) {
                 log.info("Target table \"{}\".\"{}\" already exists", schema, table);
                 // Ensure primary key constraint exists — table may have been created
@@ -105,7 +135,6 @@ public final class AutoCreateTableHelper {
                 return true;
             }
 
-            MigrationSchema migrationSchema = buildSchema(collectionDesc);
             String ddl = PgVectorSchemaGenerator.generateCreateTableDdl(
                     migrationSchema, schema, table, false);
             log.info("Auto-creating target table:\n{}", ddl);

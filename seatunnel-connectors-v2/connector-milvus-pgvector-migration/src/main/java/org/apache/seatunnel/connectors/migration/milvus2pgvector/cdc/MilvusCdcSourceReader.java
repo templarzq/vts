@@ -26,7 +26,6 @@ import org.apache.seatunnel.api.table.catalog.TablePath;
 import org.apache.seatunnel.api.table.catalog.TableSchema;
 import org.apache.seatunnel.api.table.type.SeaTunnelRow;
 import org.apache.seatunnel.connectors.migration.milvus2pgvector.cdc.streaming.CdcEventStreamStrategyV2;
-import org.apache.seatunnel.connectors.migration.milvus2pgvector.cdc.streaming.CdcEventStreamStrategyV2;
 import org.apache.seatunnel.connectors.seatunnel.milvus.sink.utils.MilvusConnectorUtils;
 import org.apache.seatunnel.connectors.migration.milvus2pgvector.schema.AutoCreateTableHelper;
 import org.apache.seatunnel.connectors.migration.milvus2pgvector.internal.TokenBucketRateLimiter;
@@ -195,14 +194,73 @@ public class MilvusCdcSourceReader implements SourceReader<SeaTunnelRow, MilvusC
         log.info("Reading snapshot split: {} (collection={}, offset={}, limit={})",
                 split.splitId(), collectionName, split.getOffset(), split.getLimit());
 
-        // Auto-create target table from Milvus collection schema if it doesn't exist
-        DescribeCollectionResp collectionDesc = collectionDescs.get(collectionName);
-        if (collectionDesc != null) {
+        // Re-describe the collection to get the latest schema.
+        // This handles two cases:
+        //   1. Initial snapshot — same as cached, no side-effect
+        //   2. Recovery snapshot after drop+recreate — fetches the new collectionId/schema
+        boolean collectionRecreated = false;
+        DescribeCollectionResp latestDesc = null;
+        try {
+            latestDesc = client.describeCollection(
+                    DescribeCollectionReq.builder().collectionName(collectionName).build());
+            // Check if the collectionId changed (indicates drop+recreate).
+            // Using java.util.Objects.equals for null-safe comparison.
+            DescribeCollectionResp cachedDesc = collectionDescs.get(collectionName);
+            if (cachedDesc != null && latestDesc != null
+                    && !java.util.Objects.equals(cachedDesc.getCollectionID(), latestDesc.getCollectionID())) {
+                collectionRecreated = true;
+                log.info("Collection '{}' was recreated: old collectionId={}, new collectionId={}",
+                        collectionName, cachedDesc.getCollectionID(), latestDesc.getCollectionID());
+                // Clear SnapStartPosition tracking so we capture a fresh position
+                snapStartCaptured.remove(collectionName);
+            }
+            collectionDescs.put(collectionName, latestDesc);
+        } catch (Exception e) {
+            String msg = e.getMessage() == null ? "" : e.getMessage().toLowerCase();
+            if (msg.contains("can't find collection") || msg.contains("not found")
+                    || msg.contains("doesn't exist") || msg.contains("not exist")) {
+                log.warn("Collection '{}' not found during snapshot, skipping split {}",
+                        collectionName, split.splitId());
+                return;
+            }
+            log.warn("Failed to re-describe collection '{}', using cached description: {}",
+                    collectionName, e.getMessage());
+            latestDesc = collectionDescs.get(collectionName);
+        }
+
+        // Update table schema if the collection was recreated or not yet cached
+        if (latestDesc != null && (collectionRecreated || tableSchema == null)) {
             try {
-                AutoCreateTableHelper.ensureTable(config, collectionDesc,
-                        cdcConfig.getSinkJdbcUrl());
+                org.apache.seatunnel.connectors.seatunnel.milvus.source.utils.MilvusSourceConnectorUtils utils =
+                        new org.apache.seatunnel.connectors.seatunnel.milvus.source.utils.MilvusSourceConnectorUtils(config);
+                java.util.Map<TablePath, CatalogTable> tables = utils.getTables();
+                if (!tables.isEmpty()) {
+                    // Look up the matching table for this collection
+                    for (CatalogTable ct : tables.values()) {
+                        if (collectionName.equals(ct.getTableId().getTableName())) {
+                            this.tableSchema = ct.getTableSchema();
+                            log.info("Updated table schema for collection '{}' after recreate",
+                                    collectionName);
+                            break;
+                        }
+                    }
+                }
             } catch (Exception e) {
-                log.warn("Auto-create table failed for collection '{}': {}",
+                log.warn("Failed to refresh table schema for collection '{}': {}",
+                        collectionName, e.getMessage());
+            }
+        }
+
+        // Auto-create (or recreate) target table from Milvus collection schema.
+        // If we detected the collection was recreated (collectionId changed), drop
+        // the old PG table and recreate from scratch to match the new schema.
+        if (latestDesc != null) {
+            boolean dropExisting = collectionRecreated;
+            try {
+                AutoCreateTableHelper.ensureTable(config, latestDesc,
+                        cdcConfig.getSinkJdbcUrl(), dropExisting);
+            } catch (Exception e) {
+                log.warn("Auto-create/recreate table failed for collection '{}': {}",
                         collectionName, e.getMessage());
             }
         }
@@ -258,13 +316,25 @@ public class MilvusCdcSourceReader implements SourceReader<SeaTunnelRow, MilvusC
             log.info("Transitioning to incremental phase");
         }
 
-        // Look up the per-collection strategy
+        // Look up the per-collection strategy (may have been closed during recovery).
+        // Re-create it with the latest collection description if needed.
         String collectionName = split.getCollectionName();
         CdcStrategy strategy = strategies.get(collectionName);
         if (strategy == null) {
-            log.warn("No CDC strategy found for collection '{}', skipping split {}",
-                    collectionName, split.splitId());
-            return;
+            // Try to re-create the strategy with the latest collection description
+            DescribeCollectionResp desc = collectionDescs.get(collectionName);
+            if (desc != null) {
+                log.info("Re-creating CDC strategy for collection '{}' after recovery", collectionName);
+                strategy = createCdcStrategy(collectionName, desc);
+                if (strategy != null) {
+                    strategies.put(collectionName, strategy);
+                }
+            }
+            if (strategy == null) {
+                log.warn("No CDC strategy found for collection '{}', skipping split {}",
+                        collectionName, split.splitId());
+                return;
+            }
         }
 
         ReplicatePosition startPosition = split.getStartPosition();
@@ -319,6 +389,8 @@ public class MilvusCdcSourceReader implements SourceReader<SeaTunnelRow, MilvusC
                         + "triggering INITIAL recovery",
                         PRECONDITION_BACKOFF_WINDOW_MS, split.splitId());
                 failRecords.remove(split.splitId());
+                // Close the old strategy so the next incremental re-creates fresh
+                closeStrategy(collectionName);
                 if (Boolean.TRUE.equals(cdcConfig.getCdcAutoRecoverStalePosition())) {
                     context.sendSourceEventToEnumerator(
                             new CheckpointInvalidatedEvent(split.splitId(),
@@ -330,8 +402,12 @@ public class MilvusCdcSourceReader implements SourceReader<SeaTunnelRow, MilvusC
             }
             // NOT_FOUND / INVALID_ARGUMENT: data-level error — WAL position GC'd.
             // Trigger INITIAL recovery immediately.
+            // NOT_FOUND typically indicates the collection was dropped while streaming:
+            // the vchannel or collection no longer exists in the WAL.
             if (code == io.grpc.Status.Code.NOT_FOUND
                     || code == io.grpc.Status.Code.INVALID_ARGUMENT) {
+                // Close the old strategy so the next incremental re-creates fresh
+                closeStrategy(collectionName);
                 if (Boolean.TRUE.equals(cdcConfig.getCdcAutoRecoverStalePosition())) {
                     log.warn("CDC position stale ({}: {}), triggering INITIAL recovery",
                             code, e.getMessage());
@@ -412,6 +488,27 @@ public class MilvusCdcSourceReader implements SourceReader<SeaTunnelRow, MilvusC
     }
 
     // ---- Private helpers ----
+
+    /**
+     * Remove the CDC strategy for a given collection from the active set.
+     * Called during error recovery when the connection is broken or the collection
+     * may have been dropped and recreated.
+     *
+     * <p>Note: we intentionally do NOT call {@code oldStrategy.close()} here because:
+     * <ul>
+     *   <li>The {@link PollingIncrementalCdcStrategy} shares the reader's {@link #client}
+     *       — calling close() would break the shared instance.</li>
+     *   <li>The {@link CdcEventStreamStrategyV2} streams are already broken (that's why
+     *       the error handler triggered recovery); the GC will clean up.</li>
+     * </ul>
+     */
+    private void closeStrategy(String collectionName) {
+        CdcStrategy oldStrategy = strategies.remove(collectionName);
+        if (oldStrategy != null) {
+            log.info("Removed CDC strategy for collection '{}' (will be re-created on next incremental split)",
+                    collectionName);
+        }
+    }
 
     /**
      * Convert a MilvusCdcSourceSplit to the format expected by MilvusBufferReader.
