@@ -385,11 +385,33 @@ public class JdbcCatalogUtils {
 
     public static Optional<Catalog> findCatalog(JdbcConnectionConfig config, JdbcDialect dialect) {
         ReadonlyConfig catalogConfig = extractCatalogConfig(config);
-        return FactoryUtil.createOptionalCatalog(
+        ClassLoader classLoader = JdbcCatalogUtils.class.getClassLoader();
+        log.info("findCatalog: dialectName={}, classLoader={}, url={}, username={}",
+                dialect.dialectName(),
+                classLoader != null ? classLoader.getClass().getName() : "null",
+                config.getUrl(),
+                config.getUsername().orElse("empty"));
+        
+        // Try to list available CatalogFactories for debugging
+        try {
+            java.util.List<org.apache.seatunnel.api.table.factory.CatalogFactory> factories =
+                    FactoryUtil.discoverFactories(classLoader,
+                            org.apache.seatunnel.api.table.factory.CatalogFactory.class);
+            log.info("findCatalog: discovered {} CatalogFactories", factories.size());
+            for (org.apache.seatunnel.api.table.factory.CatalogFactory f : factories) {
+                log.info("findCatalog: factory identifier={}", f.factoryIdentifier());
+            }
+        } catch (Exception e) {
+            log.warn("findCatalog: failed to discover CatalogFactories", e);
+        }
+        
+        Optional<Catalog> catalog = FactoryUtil.createOptionalCatalog(
                 dialect.dialectName(),
                 catalogConfig,
-                JdbcCatalogUtils.class.getClassLoader(),
+                classLoader,
                 dialect.dialectName());
+        log.info("findCatalog: result={}", catalog.isPresent() ? "present" : "empty");
+        return catalog;
     }
 
     private static ReadonlyConfig extractCatalogConfig(JdbcConnectionConfig config) {

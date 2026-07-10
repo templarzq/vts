@@ -284,17 +284,47 @@ public class JdbcSink
     }
 
     private Optional<Catalog> getCatalog() {
-        if (StringUtils.isBlank(jdbcSinkConfig.getDatabase())) {
-            return Optional.empty();
+        // For SaveMode, we need database name. Table name can be derived from catalogTable.
+        String database = jdbcSinkConfig.getDatabase();
+        if (StringUtils.isBlank(database)) {
+            // Try to get database from catalogTable as fallback
+            if (catalogTable != null && catalogTable.getTableId() != null) {
+                database = catalogTable.getTableId().getDatabaseName();
+                log.info("JdbcSink.getCatalog: database from config is blank, using catalogTable database: {}", database);
+            }
+            if (StringUtils.isBlank(database)) {
+                log.info("JdbcSink.getCatalog: database is blank, returning empty");
+                return Optional.empty();
+            }
         }
-        if (StringUtils.isBlank(jdbcSinkConfig.getTable())) {
-            return Optional.empty();
+
+        // Table name check - can use catalogTable as fallback
+        String table = jdbcSinkConfig.getTable();
+        if (StringUtils.isBlank(table)) {
+            if (catalogTable != null && catalogTable.getTableId() != null) {
+                table = catalogTable.getTableId().getTableName();
+                log.info("JdbcSink.getCatalog: table from config is blank, using catalogTable table: {}", table);
+            }
+            // If still blank, that's okay - catalog operations can proceed
+            // The actual table path will be constructed from catalogTable in getSaveModeHandler()
         }
+
         // use query to write data can not support get catalog
         if (StringUtils.isNotBlank(jdbcSinkConfig.getSimpleSql())) {
+            log.info("JdbcSink.getCatalog: simpleSql is set, returning empty");
             return Optional.empty();
         }
-        return JdbcCatalogUtils.findCatalog(jdbcSinkConfig.getJdbcConnectionConfig(), dialect);
+
+        ClassLoader contextClassLoader = Thread.currentThread().getContextClassLoader();
+        ClassLoader catalogUtilsClassLoader = JdbcCatalogUtils.class.getClassLoader();
+        log.info("JdbcSink.getCatalog: database={}, table={}, dialect={}, contextClassLoader={}, catalogUtilsClassLoader={}",
+                database, table, dialect.dialectName(),
+                contextClassLoader != null ? contextClassLoader.getClass().getName() : "null",
+                catalogUtilsClassLoader != null ? catalogUtilsClassLoader.getClass().getName() : "null");
+
+        Optional<Catalog> catalog = JdbcCatalogUtils.findCatalog(jdbcSinkConfig.getJdbcConnectionConfig(), dialect);
+        log.info("JdbcSink.getCatalog: findCatalog result={}", catalog.isPresent() ? "present" : "empty");
+        return catalog;
     }
 
     @Override

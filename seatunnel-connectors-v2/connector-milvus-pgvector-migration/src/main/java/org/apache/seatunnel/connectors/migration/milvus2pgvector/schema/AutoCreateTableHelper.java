@@ -43,13 +43,11 @@ public final class AutoCreateTableHelper {
 
     /**
      * Ensure the target table exists, creating it from the Milvus collection
-     * schema if it does not. Reads {@code url}, {@code user}, {@code password}
-     * from the sink section keys of the full job config.
+     * schema if it does not.
      *
-     * @param config         full job ReadonlyConfig (not just the source subtree)
+     * @param config         source config (contains sink_jdbc_url with optional auth params)
      * @param collectionDesc Milvus collection description
-     * @param sinkJdbcUrl    explicit JDBC URL from source cdc config (sink_jdbc_url),
-     *                       avoids source/sink key conflict in nested config
+     * @param sinkJdbcUrl    JDBC URL for target database, may include user/password params
      * @return true if the table existed or was created successfully
      */
     public static boolean ensureTable(ReadonlyConfig config,
@@ -61,12 +59,12 @@ public final class AutoCreateTableHelper {
     /**
      * Ensure the target table exists, optionally dropping it first if {@code dropExisting}
      * is true. When {@code dropExisting} is true, the table will be dropped and recreated
-     * from the current collection schema — this handles the scenario where the Milvus
-     * collection was dropped and recreated with a potentially different schema during CDC.
+     * from the current collection schema.
      *
-     * @param config         full job ReadonlyConfig (not just the source subtree)
+     * @param config         source config (contains sink_jdbc_url with optional auth params)
      * @param collectionDesc Milvus collection description
-     * @param sinkJdbcUrl    explicit JDBC URL from source cdc config (sink_jdbc_url)
+     * @param sinkJdbcUrl    JDBC URL for target database, may include user/password params
+     *                       e.g., jdbc:postgresql://host/db?user=name&amp;password=pass
      * @param dropExisting   if true, drop the target table first if it exists, then recreate
      * @return true if the table was created/verified successfully
      */
@@ -74,7 +72,7 @@ public final class AutoCreateTableHelper {
                                        DescribeCollectionResp collectionDesc,
                                        String sinkJdbcUrl,
                                        boolean dropExisting) {
-        // Use the explicit sink_jdbc_url from CDC source config (avoids nested-key issue).
+        // Use the explicit sink_jdbc_url from CDC source config.
         // schema_save_mode only works in cluster mode, so we need this for local mode.
         String url = (sinkJdbcUrl != null && !sinkJdbcUrl.isEmpty())
                 ? sinkJdbcUrl : config.toMap().get("sink_jdbc_url");
@@ -84,8 +82,10 @@ public final class AutoCreateTableHelper {
         }
 
         String tableSource = config.toMap().get("table");
-        String user = config.toMap().get("user");
-        String password = config.toMap().get("password");
+        // Extract user and password from JDBC URL parameters if present.
+        // PostgreSQL JDBC supports: jdbc:postgresql://host/db?user=name&password=pass
+        String user = extractQueryParam(url, "user");
+        String password = extractQueryParam(url, "password");
 
         String schema = "public";
         String table;
@@ -187,6 +187,33 @@ public final class AutoCreateTableHelper {
             return quoteIdent(table);
         }
         return quoteIdent(schema) + "." + quoteIdent(table);
+    }
+
+    /**
+     * Extract a query parameter from a JDBC URL.
+     * Example: jdbc:postgresql://host/db?user=name&amp;password=pass
+     */
+    private static String extractQueryParam(String url, String paramName) {
+        if (url == null || paramName == null) {
+            return null;
+        }
+        int queryStart = url.indexOf('?');
+        if (queryStart < 0 || queryStart >= url.length() - 1) {
+            return null;
+        }
+        String query = url.substring(queryStart + 1);
+        String[] pairs = query.split("&");
+        for (String pair : pairs) {
+            int eq = pair.indexOf('=');
+            if (eq > 0) {
+                String key = pair.substring(0, eq);
+                String value = pair.substring(eq + 1);
+                if (paramName.equalsIgnoreCase(key)) {
+                    return value;
+                }
+            }
+        }
+        return null;
     }
 
     private static MigrationSchema buildSchema(DescribeCollectionResp resp) {
