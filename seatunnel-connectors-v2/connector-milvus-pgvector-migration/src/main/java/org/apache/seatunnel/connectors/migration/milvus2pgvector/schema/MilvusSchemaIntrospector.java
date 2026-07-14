@@ -25,12 +25,14 @@ import io.milvus.v2.service.collection.response.DescribeCollectionResp;
 import io.milvus.v2.service.index.request.DescribeIndexReq;
 import io.milvus.v2.service.index.request.ListIndexesReq;
 import io.milvus.v2.service.index.response.DescribeIndexResp;
+import io.milvus.v2.service.partition.request.ListPartitionsReq;
 
 import lombok.extern.slf4j.Slf4j;
 import org.apache.seatunnel.connectors.migration.milvus2pgvector.exception.MigrationErrorCode;
 import org.apache.seatunnel.connectors.migration.milvus2pgvector.exception.MigrationException;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 
@@ -97,6 +99,10 @@ public class MilvusSchemaIntrospector implements AutoCloseable {
 
             List<MigrationSchema.IndexDef> indexes = collectIndexes(collectionName);
 
+            // Partition info for PG partition table support
+            List<String> partitionNames = listPartitions(collectionName);
+            Integer shardsNum = resp.getShardsNum();
+
             return MigrationSchema.builder()
                     .collectionName(collectionName)
                     .collectionDescription(resp.getDescription())
@@ -104,6 +110,8 @@ public class MilvusSchemaIntrospector implements AutoCloseable {
                     .autoId(autoId)
                     .columns(columns)
                     .indexes(indexes)
+                    .shardsNum(shardsNum != null ? shardsNum : 1)
+                    .partitionNames(partitionNames)
                     .build();
         } catch (MigrationException e) {
             throw e;
@@ -143,6 +151,19 @@ public class MilvusSchemaIntrospector implements AutoCloseable {
             log.warn("Failed to list/describe indexes for {}: {}", collectionName, e.getMessage());
         }
         return out;
+    }
+
+    /**
+     * List all partition names for the given collection.
+     */
+    private List<String> listPartitions(String collectionName) {
+        try {
+            return client.listPartitions(
+                    ListPartitionsReq.builder().collectionName(collectionName).build());
+        } catch (Exception e) {
+            log.warn("Failed to list partitions for {}: {}", collectionName, e.getMessage());
+            return Collections.emptyList();
+        }
     }
 
     @Override

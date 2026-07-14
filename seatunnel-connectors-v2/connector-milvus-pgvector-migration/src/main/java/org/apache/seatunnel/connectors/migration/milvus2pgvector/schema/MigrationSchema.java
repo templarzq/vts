@@ -24,6 +24,7 @@ import lombok.Builder;
 import lombok.Data;
 
 import java.io.Serializable;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 
@@ -44,6 +45,14 @@ public class MigrationSchema implements Serializable {
     private boolean autoId;
     private List<ColumnDef> columns;
     private List<IndexDef> indexes;
+
+    /** Number of shards from Milvus collection (used as HASH modulus for sub-partitioning). */
+    @Builder.Default
+    private Integer shardsNum = 1;
+
+    /** Ordered list of Milvus partition names for LIST partitioning. */
+    @Builder.Default
+    private List<String> partitionNames = Collections.emptyList();
 
     @Data
     @Builder

@@ -29,6 +29,7 @@ import java.sql.DriverManager;
 import java.sql.ResultSet;
 import java.sql.Statement;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 
 /**
@@ -53,7 +54,18 @@ public final class AutoCreateTableHelper {
     public static boolean ensureTable(ReadonlyConfig config,
                                        DescribeCollectionResp collectionDesc,
                                        String sinkJdbcUrl) {
-        return ensureTable(config, collectionDesc, sinkJdbcUrl, false);
+        return ensureTable(config, collectionDesc, sinkJdbcUrl, false, false);
+    }
+
+    /**
+     * Ensure the target table exists, optionally dropping it first if {@code dropExisting}
+     * is true.
+     */
+    public static boolean ensureTable(ReadonlyConfig config,
+                                       DescribeCollectionResp collectionDesc,
+                                       String sinkJdbcUrl,
+                                       boolean dropExisting) {
+        return ensureTable(config, collectionDesc, sinkJdbcUrl, dropExisting, false);
     }
 
     /**
@@ -66,12 +78,30 @@ public final class AutoCreateTableHelper {
      * @param sinkJdbcUrl    JDBC URL for target database, may include user/password params
      *                       e.g., jdbc:postgresql://host/db?user=name&amp;password=pass
      * @param dropExisting   if true, drop the target table first if it exists, then recreate
+     * @param enablePartition if true, creates a partitioned table based on Milvus partitions
      * @return true if the table was created/verified successfully
      */
     public static boolean ensureTable(ReadonlyConfig config,
                                        DescribeCollectionResp collectionDesc,
                                        String sinkJdbcUrl,
-                                       boolean dropExisting) {
+                                       boolean dropExisting,
+                                       boolean enablePartition) {
+        return ensureTable(config, collectionDesc, sinkJdbcUrl, dropExisting,
+                enablePartition, Collections.emptyList());
+    }
+
+    /**
+     * Ensure the target table exists with full partition info.
+     *
+     * @param partitionNames Milvus partition names for LIST partitioning; used only when
+     *                       {@code enablePartition} is true
+     */
+    public static boolean ensureTable(ReadonlyConfig config,
+                                       DescribeCollectionResp collectionDesc,
+                                       String sinkJdbcUrl,
+                                       boolean dropExisting,
+                                       boolean enablePartition,
+                                       List<String> partitionNames) {
         // Use the explicit sink_jdbc_url from CDC source config.
         // schema_save_mode only works in cluster mode, so we need this for local mode.
         String url = (sinkJdbcUrl != null && !sinkJdbcUrl.isEmpty())
@@ -97,8 +127,13 @@ public final class AutoCreateTableHelper {
             table = tableSource != null ? tableSource : collectionDesc.getCollectionName();
         }
 
+        try {
+            Class.forName("org.postgresql.Driver");
+        } catch (ClassNotFoundException e) {
+            log.warn("PostgreSQL JDBC driver not found: {}", e.getMessage());
+        }
         try (Connection conn = DriverManager.getConnection(url, user, password)) {
-            MigrationSchema migrationSchema = buildSchema(collectionDesc);
+            MigrationSchema migrationSchema = buildSchema(collectionDesc, partitionNames);
 
             if (dropExisting && tableExists(conn, schema, table)) {
                 String dropSql = "DROP TABLE IF EXISTS " + quoteQualified(schema, table) + " CASCADE";
@@ -136,10 +171,15 @@ public final class AutoCreateTableHelper {
             }
 
             String ddl = PgVectorSchemaGenerator.generateCreateTableDdl(
-                    migrationSchema, schema, table, false);
+                    migrationSchema, schema, table, false, enablePartition);
             log.info("Auto-creating target table:\n{}", ddl);
             try (Statement stmt = conn.createStatement()) {
-                stmt.execute(ddl);
+                for (String sql : ddl.split(";")) {
+                    String trimmed = sql.trim();
+                    if (!trimmed.isEmpty()) {
+                        stmt.execute(trimmed + ";");
+                    }
+                }
             }
             log.info("Target table \"{}\".\"{}\" created successfully", schema, table);
             return true;
@@ -216,7 +256,8 @@ public final class AutoCreateTableHelper {
         return null;
     }
 
-    private static MigrationSchema buildSchema(DescribeCollectionResp resp) {
+    private static MigrationSchema buildSchema(DescribeCollectionResp resp,
+                                                List<String> partitionNames) {
         CreateCollectionReq.CollectionSchema cs = resp.getCollectionSchema();
         List<MigrationSchema.ColumnDef> columns = new ArrayList<>();
         String pkName = null;
@@ -238,10 +279,14 @@ public final class AutoCreateTableHelper {
             }
         }
 
+        Integer shardsNum = resp.getShardsNum();
+
         return MigrationSchema.builder()
                 .collectionName(resp.getCollectionName())
                 .primaryKeyName(pkName)
                 .columns(columns)
+                .shardsNum(shardsNum != null ? shardsNum : 1)
+                .partitionNames(partitionNames)
                 .build();
     }
 }

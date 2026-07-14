@@ -271,6 +271,13 @@ public class MilvusCdcSourceConfig implements Serializable {
      * checkpoint. Use only when you know the exact WAL position to resume from.
      */
     /** Max rows per second for data migration; <= 0 means unlimited. */
+    public static final Option<Boolean> ENABLE_PG_PARTITION =
+            Options.key("enable_pg_partition")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withDescription(
+                            "Enable PostgreSQL native partitioning based on Milvus partitions. "
+                                    + "When enabled, creates a LIST + HASH two-level partitioned table.");
     public static final Option<Integer> CDC_RATE_LIMIT_ROWS_PER_SECOND =
             Options.key("cdc_rate_limit_rows_per_second")
                     .intType()
@@ -365,6 +372,8 @@ public class MilvusCdcSourceConfig implements Serializable {
     private Integer cdcCollectionLoadMaxRetries = 60;
     @Builder.Default
     private Long cdcCollectionLoadRetryDelayMs = 5000L;
+    @Builder.Default
+    private boolean enablePgPartition = false;
 
     public static MilvusCdcSourceConfig of(ReadonlyConfig config) {
         return MilvusCdcSourceConfig.builder()
@@ -405,6 +414,7 @@ public class MilvusCdcSourceConfig implements Serializable {
                 .cdcStreamOpenRetryDelayMs(config.get(CDC_STREAM_OPEN_RETRY_DELAY_MS))
                 .cdcCollectionLoadMaxRetries(config.get(CDC_COLLECTION_LOAD_MAX_RETRIES))
                 .cdcCollectionLoadRetryDelayMs(config.get(CDC_COLLECTION_LOAD_RETRY_DELAY_MS))
+                .enablePgPartition(config.get(ENABLE_PG_PARTITION))
                 .build();
     }
 

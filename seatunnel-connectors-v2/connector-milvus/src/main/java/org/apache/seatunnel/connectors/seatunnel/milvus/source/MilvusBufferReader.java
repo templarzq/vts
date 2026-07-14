@@ -25,7 +25,7 @@ import java.util.concurrent.CountDownLatch;
 @Slf4j
 public class MilvusBufferReader {
     private final Collector<SeaTunnelRow> output;
-    private final MilvusSourceConverter milvusSourceConverter;
+    private MilvusSourceConverter milvusSourceConverter;
     private final MilvusClientV2 milvusClient;
     private final String collectionName;
     private final String partitionName;
@@ -59,6 +59,14 @@ public class MilvusBufferReader {
         this.partitionName = split.getPartitionName();
         this.offset = split.getOffset();
         this.limit = split.getLimit();
+    }
+
+    /**
+     * Replace the default converter with a custom one (e.g., {@code MilvusSourceConverterWithPartition}).
+     * Must be called before {@link #pollData}.
+     */
+    public void setMilvusSourceConverter(MilvusSourceConverter converter) {
+        this.milvusSourceConverter = converter;
     }
 
     /** Configure collection load retry behavior. Call before {@link #pollData}. */

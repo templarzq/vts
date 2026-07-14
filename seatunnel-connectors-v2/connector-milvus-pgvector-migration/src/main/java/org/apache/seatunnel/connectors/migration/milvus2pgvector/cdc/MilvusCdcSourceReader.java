@@ -28,6 +28,7 @@ import org.apache.seatunnel.api.table.type.SeaTunnelRow;
 import org.apache.seatunnel.connectors.migration.milvus2pgvector.cdc.streaming.CdcEventStreamStrategyV2;
 import org.apache.seatunnel.connectors.seatunnel.milvus.sink.utils.MilvusConnectorUtils;
 import org.apache.seatunnel.connectors.migration.milvus2pgvector.schema.AutoCreateTableHelper;
+import org.apache.seatunnel.connectors.migration.milvus2pgvector.schema.PgVectorSchemaGenerator;
 import org.apache.seatunnel.connectors.migration.milvus2pgvector.internal.TokenBucketRateLimiter;
 import org.apache.seatunnel.connectors.seatunnel.milvus.source.MilvusBufferReader;
 import org.apache.seatunnel.connectors.seatunnel.milvus.source.MilvusSourceSplit;
@@ -36,11 +37,13 @@ import org.apache.seatunnel.connectors.seatunnel.milvus.source.utils.MilvusSourc
 import io.milvus.v2.client.MilvusClientV2;
 import io.milvus.v2.service.collection.request.DescribeCollectionReq;
 import io.milvus.v2.service.collection.response.DescribeCollectionResp;
+import io.milvus.v2.service.partition.request.ListPartitionsReq;
 
 import lombok.extern.slf4j.Slf4j;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Deque;
 import java.util.HashMap;
 import java.util.List;
@@ -80,6 +83,7 @@ public class MilvusCdcSourceReader implements SourceReader<SeaTunnelRow, MilvusC
     private final Map<String, DescribeCollectionResp> collectionDescs = new ConcurrentHashMap<>();
     private TableSchema tableSchema;
     private TokenBucketRateLimiter rateLimiter;
+    private boolean enablePgPartition;
     private volatile boolean noMoreSplit;
     private volatile boolean snapshotPhase = true;
     /** Track which collections have captured SnapStartPosition. */
@@ -121,9 +125,17 @@ public class MilvusCdcSourceReader implements SourceReader<SeaTunnelRow, MilvusC
             log.info("Rate limiter enabled: {} rows/second", rateLimit);
         }
 
-        // Use the first catalog table schema for the snapshot converter
-        CatalogTable firstCatalogTable = sourceTables.values().iterator().next();
-        this.tableSchema = firstCatalogTable.getTableSchema();
+        // Use the first catalog table that matches a configured collection for the snapshot converter
+        this.tableSchema = sourceTables.values().stream()
+                .filter(ct -> cdcConfig.shouldSyncCollection(ct.getTableId().getTableName()))
+                .findFirst()
+                .map(CatalogTable::getTableSchema)
+                .orElseGet(() -> sourceTables.values().iterator().next().getTableSchema());
+        this.enablePgPartition = cdcConfig.isEnablePgPartition();
+        if (enablePgPartition) {
+            log.info("Partition mode enabled. '{}' column will be added by transform.",
+                    PgVectorSchemaGenerator.PARTITION_COLUMN_NAME);
+        }
 
         // Initialize per-collection descriptors, converters and strategies
         for (Map.Entry<TablePath, CatalogTable> entry : sourceTables.entrySet()) {
@@ -256,17 +268,27 @@ public class MilvusCdcSourceReader implements SourceReader<SeaTunnelRow, MilvusC
         // the old PG table and recreate from scratch to match the new schema.
         if (latestDesc != null) {
             boolean dropExisting = collectionRecreated;
+            List<String> partitionNames = Collections.emptyList();
+            if (enablePgPartition) {
+                try {
+                    partitionNames = client.listPartitions(
+                            ListPartitionsReq.builder().collectionName(collectionName).build());
+                } catch (Exception e) {
+                    log.warn("Failed to list partitions for '{}': {}", collectionName, e.getMessage());
+                }
+            }
             try {
                 AutoCreateTableHelper.ensureTable(config, latestDesc,
-                        cdcConfig.getSinkJdbcUrl(), dropExisting);
+                        cdcConfig.getSinkJdbcUrl(), dropExisting,
+                        enablePgPartition, partitionNames);
             } catch (Exception e) {
                 log.warn("Auto-create/recreate table failed for collection '{}': {}",
                         collectionName, e.getMessage());
             }
         }
 
-        // Use the first collection's schema for the snapshot converter.
-        // All collections in our CDC scenario share the same schema structure.
+        // Use the original table schema for the snapshot converter.
+        // __partition_name column is added later by the MilvusToPgVectorTransform.
         TableSchema colSchema = tableSchema;
 
         // Convert to MilvusSourceSplit so we can reuse MilvusBufferReader

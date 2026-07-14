@@ -79,7 +79,8 @@ public class MilvusCdcSourceFactory implements ChangeStreamTableSourceFactory {
                         MilvusCdcSourceConfig.CDC_ETCD_CLIENT_KEY_PATH,
                         MilvusCdcSourceConfig.CDC_ETCD_USERNAME,
                         MilvusCdcSourceConfig.CDC_ETCD_PASSWORD,
-                        MilvusCdcSourceConfig.CDC_AUTO_RECOVER_STALE_POSITION)
+                        MilvusCdcSourceConfig.CDC_AUTO_RECOVER_STALE_POSITION,
+                        MilvusCdcSourceConfig.ENABLE_PG_PARTITION)
                 .build();
     }
 

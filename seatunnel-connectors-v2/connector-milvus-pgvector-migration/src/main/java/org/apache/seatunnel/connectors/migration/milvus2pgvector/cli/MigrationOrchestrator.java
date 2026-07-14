@@ -265,6 +265,7 @@ public class MigrationOrchestrator {
                             .rateLimitRowsPerSecond(config.getRateLimitRowsPerSecond())
                             .skipIndexMigration(config.isSkipIndexMigration())
                             .dropExistingTable(config.isDropExistingTable())
+                            .enablePgPartition(config.isEnablePgPartition())
                             .validationSampleSize(config.getValidationSampleSize())
                             .passRateThreshold(config.getPassRateThreshold())
                             .auditLogDir(config.getAuditLogDir())

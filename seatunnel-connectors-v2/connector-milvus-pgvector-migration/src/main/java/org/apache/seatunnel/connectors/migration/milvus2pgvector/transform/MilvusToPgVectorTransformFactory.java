@@ -41,6 +41,7 @@ public class MilvusToPgVectorTransformFactory implements TableTransformFactory {
                 .optional(MilvusToPgVectorTransformConfig.PG_DATABASE)
                 .optional(MilvusToPgVectorTransformConfig.PG_SCHEMA)
                 .optional(MilvusToPgVectorTransformConfig.PG_TABLE)
+                .optional(MilvusToPgVectorTransformConfig.ENABLE_PG_PARTITION)
                 .optional(TransformCommonOptions.MULTI_TABLES)
                 .optional(TransformCommonOptions.TABLE_MATCH_REGEX)
                 .build();

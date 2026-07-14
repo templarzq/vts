@@ -54,6 +54,8 @@ public class MigrationConfig {
     @Builder.Default private boolean skipIndexMigration = false;
     /** Drop target table before migration if it exists. */
     @Builder.Default private boolean dropExistingTable = false;
+    /** Enable PG native partitioning based on Milvus partitions. Default: false (backward compatible). */
+    @Builder.Default private boolean enablePgPartition = false;
 
     // ---- validation ----
     @Builder.Default private int validationSampleSize = 100;

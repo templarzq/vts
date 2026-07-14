@@ -52,15 +52,24 @@ public class MilvusToPgVectorTransformConfig implements Serializable {
                     .withDescription(
                             "pgvector target table name; defaults to the Milvus collection name");
 
+    public static final Option<Boolean> ENABLE_PG_PARTITION =
+            Options.key("enable_pg_partition")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withDescription(
+                            "Enable PostgreSQL native partitioning based on Milvus partitions");
+
     private String pgDatabase;
     private String pgSchema;
     private String pgTable;
+    private boolean enablePgPartition;
 
     public static MilvusToPgVectorTransformConfig of(ReadonlyConfig config) {
         MilvusToPgVectorTransformConfig c = new MilvusToPgVectorTransformConfig();
         c.setPgDatabase(config.get(PG_DATABASE));
         c.setPgSchema(config.get(PG_SCHEMA));
         c.setPgTable(config.get(PG_TABLE));
+        c.setEnablePgPartition(config.get(ENABLE_PG_PARTITION));
         return c;
     }
 }
